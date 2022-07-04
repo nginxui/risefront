@@ -42,7 +42,7 @@ func proxy(srvConn, cliConn net.Conn) {
 // This does the actual data transfer.
 // The broker only closes the src side.
 func broker(dst, src net.Conn, srcClosed chan struct{}) {
-	io.Copy(dst, src)
+	io.Copy(dst, src) //nolint:errcheck
 	src.Close()
 
 	// We can handle errors in a finer-grained manner by inlining io.Copy (it's

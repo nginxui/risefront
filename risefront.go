@@ -45,7 +45,7 @@ func New(ctx context.Context, cfg Config) error {
 		return cfg.runParent(ctx)
 	}
 
-	return cfg.runChild(ctx, c)
+	return cfg.runChild(c)
 }
 
 func (cfg Config) handleErr(kind string, err error) {
@@ -106,22 +106,7 @@ func (cfg Config) runParent(ctx context.Context) error {
 
 		// external listener
 		connCh := make(chan net.Conn, 1)
-		go func() {
-			defer close(connCh)
-			for {
-				rw, err := ln.Accept()
-
-				if err != nil {
-					cfg.handleErr("parent.external.Accept", err)
-					if ne, ok := err.(net.Error); ok && ne.Timeout() {
-						time.Sleep(5 * time.Millisecond)
-						continue
-					}
-					return
-				}
-				connCh <- rw
-			}
-		}()
+		go cfg.runExternalListener(ln, connCh)
 
 		// first child listener
 		sl := firstChildListener{
@@ -129,49 +114,17 @@ func (cfg Config) runParent(ctx context.Context) error {
 			ch:   make(chan net.Conn),
 		}
 		firstChildListeners = append(firstChildListeners, &sl)
-		fw := &forwarder{
-			handle: sl.Forward,
-			close: func() {
-				sl.Close()
-			},
-		}
 
 		// internal listener
 		forwarderCh := make(chan *forwarder)
 		forwarderChs = append(forwarderChs, forwarderCh)
 
 		wgInternalListeners.Add(1)
-		go func() {
-			defer wgInternalListeners.Done()
-			for {
-				select {
-				case conn, ok := <-connCh:
-					if !ok { // channel closed
-						fw.closeAndWait()
-						return
-					}
-					fw.wg.Add(1)
-					fw.handle(wgCloser{
-						Conn: conn,
-						done: fw.wg.Done,
-					})
-
-				case newFw := <-forwarderCh:
-					oldFw := fw
-					fw = newFw
-
-					fw.wg.Add(1)
-					go func() {
-						oldFw.closeAndWait()
-						fw.wg.Done()
-					}()
-				}
-			}
-		}()
+		go cfg.runInternalListener(connCh, forwarderCh, &sl, wgInternalListeners.Done)
 	}
 
 	// All set, run first child
-	go cfg.Run(firstChildListeners)
+	go cfg.Run(firstChildListeners) //nolint:errcheck
 
 	// listen for new children
 	for {
@@ -181,7 +134,7 @@ func (cfg Config) runParent(ctx context.Context) error {
 				return ctx.Err()
 			}
 			cfg.handleErr("parent.sock.Accept", err)
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() { //nolint: errorlint
 				time.Sleep(5 * time.Millisecond)
 				continue
 			}
@@ -200,6 +153,58 @@ func (cfg Config) runParent(ctx context.Context) error {
 	}
 }
 
+func (cfg Config) runExternalListener(ln net.Listener, ch chan net.Conn) {
+	defer close(ch)
+	for {
+		rw, err := ln.Accept()
+
+		if err != nil {
+			cfg.handleErr("parent.external.Accept", err)
+			if ne, ok := err.(net.Error); ok && ne.Timeout() { //nolint: errorlint
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
+			return
+		}
+		ch <- rw
+	}
+}
+
+func (cfg Config) runInternalListener(connCh chan net.Conn, forwarderCh chan *forwarder, sl *firstChildListener, done func()) {
+	defer done()
+
+	fw := &forwarder{
+		handle: sl.Forward,
+		close: func() {
+			sl.Close()
+		},
+	}
+	for {
+		select {
+		case conn, ok := <-connCh:
+			if !ok { // channel closed
+				fw.closeAndWait()
+				return
+			}
+			fw.wg.Add(1)
+			fw.handle(wgCloser{
+				Conn: conn,
+				done: fw.wg.Done,
+			})
+
+		case newFw := <-forwarderCh:
+			oldFw := fw
+			fw = newFw
+
+			fw.wg.Add(1)
+			go func() {
+				oldFw.closeAndWait()
+				fw.wg.Done()
+			}()
+		}
+	}
+}
+
 func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarder, error) {
 	r := io.TeeReader(rw, os.Stdout)
 	decoder := json.NewDecoder(r)
@@ -211,7 +216,7 @@ func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarder, error
 	}
 	if len(req.Addresses) != len(cfg.Addresses) {
 		msg := fmt.Sprintf("wrong number of addresses, got %d, expected %d", len(req.Addresses), len(cfg.Addresses))
-		rw.Write([]byte(msg))
+		rw.Write([]byte(msg)) //nolint:errcheck
 
 		rw.Close()
 		return nil, errors.New(msg)
@@ -259,21 +264,26 @@ func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarder, error
 	return forwarders, nil
 }
 
-func (cfg Config) runChild(ctx context.Context, rw io.ReadWriteCloser) error {
+func (cfg Config) runChild(rw io.ReadWriteCloser) error {
 	defer rw.Close()
 
 	listeners := make([]net.Listener, 0, len(cfg.Addresses))
 	addresses := make([]string, 0, len(cfg.Addresses))
-	prefix := "child-" + randStringBytesMaskImprSrc(6) + "-"
+	prefix, err := randomPrefix(6)
+	if err != nil {
+		return err
+	}
+	prefix = "child-" + prefix + "-"
 	for i := range cfg.Addresses {
-		name := prefix + strconv.Itoa(i)
+		name := prefix + strconv.Itoa(i) + ".sock"
 
 		// hack to ensure that a dangling socket gets cleaned up before listening
 		if conn, _ := cfg.Dialer.Dial(name); conn != nil {
 			conn.Close()
 		}
 
-		ln, err := cfg.Dialer.Listen(name)
+		var ln net.Listener
+		ln, err = cfg.Dialer.Listen(name)
 		if err != nil {
 			return err
 		}
@@ -284,7 +294,7 @@ func (cfg Config) runChild(ctx context.Context, rw io.ReadWriteCloser) error {
 	}
 
 	encoder := json.NewEncoder(rw)
-	err := encoder.Encode(ChildRequest{
+	err = encoder.Encode(ChildRequest{
 		Addresses: addresses,
 	})
 	if err != nil {
@@ -310,12 +320,13 @@ func (cfg Config) runChild(ctx context.Context, rw io.ReadWriteCloser) error {
 	return nil
 }
 
-// https://stackoverflow.com/a/46909816/3207406
-// RandStringBytesMaskImprSrc returns a random hexadecimal string of length n.
-func randStringBytesMaskImprSrc(n int) string {
-	b := make([]byte, (n+1)/2) // can be simplified to n/2 if n is always even
-	rand.Read(b)               // always returns len(p) and a nil error
-	return hex.EncodeToString(b)[:n]
+func randomPrefix(n int) (string, error) {
+	b := make([]byte, n)
+	_, err := rand.Read(b)
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 type ChildRequest struct {

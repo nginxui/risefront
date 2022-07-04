@@ -1,12 +1,13 @@
 package risefront
 
 import (
+	"errors"
 	"net"
 	"os"
 	"syscall"
 )
 
-// PrefixDialer uses github.com/Microsoft/go-winio.{DialPipe,ListenPipe} on windows and net.{Dial,Listen} on other platforms
+// PrefixDialer uses github.com/Microsoft/go-winio.{DialPipe,ListenPipe} on windows and net.{Dial,Listen} on other platforms.
 type PrefixDialer struct {
 	Prefix string
 }
@@ -31,16 +32,9 @@ func (pd PrefixDialer) Dial(name string) (net.Conn, error) {
 }
 
 func errorIsNobodyListening(err error) bool {
-	netErr, ok := err.(*net.OpError)
-	if !ok {
-		return false
+	sysErr := &os.SyscallError{}
+	if errors.As(err, &sysErr) {
+		return sysErr.Syscall == "connect" && sysErr.Err == syscall.Errno(111) //nolint:errorlint
 	}
-	sysErr, ok := netErr.Err.(*os.SyscallError)
-	if !ok {
-		return false
-	}
-	if sysErr.Syscall != "connect" || sysErr.Err != syscall.Errno(111) {
-		return false
-	}
-	return true
+	return false
 }

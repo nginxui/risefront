@@ -33,7 +33,7 @@ func TestMain(m *testing.M) {
 }
 
 func selfCmd(mode string, arg ...string) *exec.Cmd {
-	cmd := exec.Command(os.Args[0], arg...)
+	cmd := exec.Command(os.Args[0], arg...) //nolint:gosec
 	cmd.Env = []string{"RISEFRONT_TEST_MODE=" + mode}
 	return cmd
 }
@@ -72,7 +72,7 @@ func TestEndToEnd(t *testing.T) {
 						assert.NilError(t, err)
 					}),
 				}
-				defer s.Shutdown(context.Background())
+				defer s.Shutdown(context.Background()) //nolint:errcheck
 				err := s.Serve(l[0])
 				t.Log("parentFirstChild.Serve", err)
 				close(parentFirstChildDone)
@@ -112,13 +112,13 @@ func TestEndToEnd(t *testing.T) {
 				s := http.Server{
 					Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 						t.Log("request child", r.URL.Path)
-						_, err := w.Write([]byte("hello child"))
-						assert.NilError(t, err)
+						_, errW := w.Write([]byte("hello child"))
+						assert.NilError(t, errW)
 					}),
 				}
-				defer s.Shutdown(context.Background())
-				err := s.Serve(l[0])
-				t.Log("child.Serve", err)
+				defer s.Shutdown(context.Background()) //nolint:errcheck
+				errRun := s.Serve(l[0])
+				t.Log("child.Serve", errRun)
 				return nil
 			},
 		})
@@ -136,7 +136,6 @@ func TestEndToEnd(t *testing.T) {
 	case <-parentFirstChildDone:
 	case <-time.After(time.Second):
 		t.Error("parent first child took too long to close")
-
 	}
 
 	resp, err = http.Get("http://" + testAddr)
@@ -187,7 +186,7 @@ func TestFirstChildSlowRequest(t *testing.T) {
 						atomic.AddUint32(&handlerCalled, 1)
 					}),
 				}
-				defer s.Shutdown(context.Background())
+				defer s.Shutdown(context.Background()) //nolint:errcheck
 				err := s.Serve(l[0])
 				t.Log("Serve", err)
 				return nil

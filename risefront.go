@@ -26,9 +26,8 @@ type Config struct {
 	Network   string // "tcp" (default), "tcp4", "tcp6", "unix" or "unixpacket"
 	Addresses []string
 
-	Run            func([]net.Listener) error // all running connections should be closed before returning (srv.Shutdown for instance)
-	TriggerUpgrade chan<- struct{}
-	ErrorHandler   func(string, error)
+	Run          func([]net.Listener) error // all running connections should be closed before returning (srv.Shutdown for http.Server for instance)
+	ErrorHandler func(string, error)
 }
 
 func New(ctx context.Context, cfg Config) error {

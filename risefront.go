@@ -94,8 +94,11 @@ func (cfg Config) runParent(ctx context.Context) error {
 			ln.Close()
 		}
 	}
+
 	defer func() {
+		lock.RLock()
 		childClose()
+		lock.RUnlock()
 	}()
 
 	// listen on all provided addresses

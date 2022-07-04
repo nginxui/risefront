@@ -55,7 +55,16 @@ func (cfg Config) handleErr(kind string, err error) {
 	}
 }
 
-type forwarder func(net.Conn)
+type forwarder struct {
+	handle func(net.Conn)
+	close  func()
+	wg     sync.WaitGroup
+}
+
+func (f *forwarder) closeAndWait() {
+	f.close()
+	f.wg.Wait()
+}
 
 type wgCloser struct {
 	net.Conn
@@ -81,30 +90,13 @@ func (cfg Config) runParent(ctx context.Context) error {
 	}()
 	defer lnChild.Close()
 
-	var wgChildrenListeners sync.WaitGroup
-	defer wgChildrenListeners.Wait()
+	var wgInternalListeners sync.WaitGroup
+	defer wgInternalListeners.Wait()
 
 	firstChildListeners := make([]net.Listener, 0, len(cfg.Addresses))
 
-	var lock sync.RWMutex
-	childClosing := false
-	childForwarders := make([]forwarder, 0, len(cfg.Addresses))
-	childClose := func() error {
-		for _, sl := range firstChildListeners {
-			sl.Close()
-		}
-		return nil
-	}
-
-	defer func() {
-		lock.Lock()
-		childClosing = true
-		childClose()
-		lock.Unlock()
-	}()
-
-	// listen on all provided addresses
-	// and populate the firstChildListeners
+	// listen on all provided addresses and forward to channel
+	forwarderChs := make([]chan *forwarder, 0, len(cfg.Addresses))
 	for _, a := range cfg.Addresses {
 		ln, err := net.Listen(cfg.Network, a)
 		if err != nil {
@@ -112,42 +104,67 @@ func (cfg Config) runParent(ctx context.Context) error {
 		}
 		defer ln.Close()
 
+		// external listener
+		connCh := make(chan net.Conn, 1)
+		go func() {
+			defer close(connCh)
+			for {
+				rw, err := ln.Accept()
+
+				if err != nil {
+					cfg.handleErr("parent.external.Accept", err)
+					if ne, ok := err.(net.Error); ok && ne.Timeout() {
+						time.Sleep(5 * time.Millisecond)
+						continue
+					}
+					return
+				}
+				connCh <- rw
+			}
+		}()
+
+		// first child listener
 		sl := firstChildListener{
 			addr: ln.Addr(),
 			ch:   make(chan net.Conn),
 		}
 		firstChildListeners = append(firstChildListeners, &sl)
-		i := len(childForwarders)
-		childForwarders = append(childForwarders, sl.Forward)
+		fw := &forwarder{
+			handle: sl.Forward,
+			close: func() {
+				sl.Close()
+			},
+		}
 
-		wgChildrenListeners.Add(1) // for the listener
+		// internal listener
+		forwarderCh := make(chan *forwarder)
+		forwarderChs = append(forwarderChs, forwarderCh)
+
+		wgInternalListeners.Add(1)
 		go func() {
-			defer wgChildrenListeners.Done() // for the listener
-
+			defer wgInternalListeners.Done()
 			for {
-				wgChildrenListeners.Add(1) // per connection
-
-				rw, err := ln.Accept()
-
-				// no point continuing if the err is net.ErrClosed
-				if err != nil && errors.Is(err, net.ErrClosed) {
-					wgChildrenListeners.Done() // per connection
-					return
-				}
-				if err != nil {
-					cfg.handleErr("Accept", err)
-				}
-
-				lock.RLock()
-				isClosing := childClosing
-				forward := childForwarders[i]
-				lock.RUnlock()
-
-				if !isClosing {
-					go forward(wgCloser{
-						Conn: rw,
-						done: wgChildrenListeners.Done,
+				select {
+				case conn, ok := <-connCh:
+					if !ok { // channel closed
+						fw.closeAndWait()
+						return
+					}
+					fw.wg.Add(1)
+					fw.handle(wgCloser{
+						Conn: conn,
+						done: fw.wg.Done,
 					})
+
+				case newFw := <-forwarderCh:
+					oldFw := fw
+					fw = newFw
+
+					fw.wg.Add(1)
+					go func() {
+						oldFw.closeAndWait()
+						fw.wg.Done()
+					}()
 				}
 			}
 		}()
@@ -171,52 +188,52 @@ func (cfg Config) runParent(ctx context.Context) error {
 			return err
 		}
 
-		newForwarders, newChildClose, err := cfg.handleChildRequest(rw)
+		newForwarders, err := cfg.handleChildRequest(rw)
 		if err != nil {
 			cfg.handleErr("child.Request", err)
 			continue
 		}
 
-		lock.Lock()
-		previousCloser := childClose
-		childForwarders = newForwarders
-		childClose = newChildClose
-		lock.Unlock()
-
-		go previousCloser()
+		for i, fw := range newForwarders {
+			forwarderChs[i] <- fw
+		}
 	}
 }
 
-func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]forwarder, func() error, error) {
+func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarder, error) {
 	decoder := json.NewDecoder(rw)
 	var req ChildRequest
 	err := decoder.Decode(&req)
 	if err != nil {
 		rw.Close()
-		return nil, nil, err
+		return nil, err
 	}
 	if len(req.Addresses) != len(cfg.Addresses) {
 		msg := fmt.Sprintf("wrong number of addresses, got %d, expected %d", len(req.Addresses), len(cfg.Addresses))
 		rw.Write([]byte(msg))
 
 		rw.Close()
-		return nil, nil, errors.New(msg)
+		return nil, errors.New(msg)
 	}
 
-	forwarders := make([]forwarder, 0, len(cfg.Addresses))
+	forwarders := make([]*forwarder, 0, len(cfg.Addresses))
+	var wgClose sync.WaitGroup
 	for _, a := range req.Addresses {
+		wgClose.Add(1)
 		addr := a
-		forwarders = append(forwarders, func(cliConn net.Conn) {
-			srvConn, err := cfg.Dialer.Dial(addr)
-			if err != nil {
-				cliConn.Close()
-				cfg.handleErr(addr, err)
-				return
-			}
+		forwarders = append(forwarders, &forwarder{
+			handle: func(cliConn net.Conn) {
+				srvConn, err := cfg.Dialer.Dial(addr)
+				if err != nil {
+					cliConn.Close()
+					cfg.handleErr(addr, err)
+					return
+				}
 
-			go proxy(srvConn, cliConn)
-		},
-		)
+				go proxy(srvConn, cliConn)
+			},
+			close: wgClose.Done,
+		})
 	}
 
 	// keepalive
@@ -231,7 +248,13 @@ func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]forwarder, func()
 		}
 	}()
 
-	return forwarders, rw.Close, nil
+	// close connection when all forwarders are done
+	go func() {
+		wgClose.Wait()
+		rw.Close()
+	}()
+
+	return forwarders, nil
 }
 
 func (cfg Config) runChild(ctx context.Context, rw io.ReadWriteCloser) error {

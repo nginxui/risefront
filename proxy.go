@@ -2,7 +2,6 @@ package risefront
 
 import (
 	"io"
-	"log"
 	"net"
 )
 
@@ -41,19 +40,22 @@ func proxy(srvConn, cliConn net.Conn) {
 }
 
 // This does the actual data transfer.
-// The broker only closes the Read side.
+// The broker only closes the src side.
 func broker(dst, src net.Conn, srcClosed chan struct{}) {
+	io.Copy(dst, src)
+	src.Close()
+
 	// We can handle errors in a finer-grained manner by inlining io.Copy (it's
 	// simple, and we drop the ReaderFrom or WriterTo checks for
 	// net.Conn->net.Conn transfers, which aren't needed). This would also let
 	// us adjust buffersize.
-	_, err := io.Copy(dst, src)
+	// _, err := io.Copy(dst, src)
 
-	if err != nil {
-		log.Printf("Copy error: %s", err)
-	}
-	if err := src.Close(); err != nil {
-		log.Printf("Close error: %s", err)
-	}
+	// if err != nil {
+	// 	log.Printf("Copy error: %s", err)
+	// }
+	// if err := src.Close(); err != nil {
+	// 	log.Printf("Close error: %s", err)
+	// }
 	srcClosed <- struct{}{}
 }

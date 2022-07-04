@@ -52,7 +52,7 @@ func TestEndToEnd(t *testing.T) {
 		And the slow reply.
 	*/
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	parentDone := make(chan struct{})
@@ -156,7 +156,7 @@ func TestEndToEnd(t *testing.T) {
 
 func TestFirstChildSlowRequest(t *testing.T) {
 	os.Remove("risefront.sock")
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	parentDone := make(chan struct{})
@@ -226,7 +226,7 @@ func TestFirstChildSlowRequest(t *testing.T) {
 
 	select {
 	case <-parentDone:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Error("parent took too long to shutdown")
 	}
 }
@@ -237,7 +237,7 @@ func TestExistingSocket(t *testing.T) {
 	out, err := cmd.CombinedOutput()
 	assert.NilError(t, err, string(out))
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	parentDone := make(chan struct{})
@@ -265,7 +265,7 @@ func TestExistingSocket(t *testing.T) {
 	cancel()
 	select {
 	case <-parentDone:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Error("parent took too long to shutdown")
 	}
 }

@@ -55,26 +55,7 @@ func (cfg Config) handleErr(kind string, err error) {
 	}
 }
 
-type forwarder func(net.Conn, error)
-
-type forwarderWg struct {
-	handle func(net.Conn, error)
-}
-
-func (f *forwarderWg) goHandle(wg *sync.WaitGroup, c net.Conn, err error) {
-	if err != nil {
-		fmt.Println("forwarding-err")
-		f.handle(nil, err)
-		return
-	}
-
-	wg.Add(1)
-	fmt.Println("forwarding")
-	f.handle(wgCloser{
-		Conn: c,
-		done: wg.Done,
-	}, err)
-}
+type forwarder func(net.Conn)
 
 type wgCloser struct {
 	net.Conn
@@ -83,8 +64,7 @@ type wgCloser struct {
 
 func (wc wgCloser) Close() error {
 	err := wc.Conn.Close()
-	fmt.Println("CLOSE", err)
-	if wc.done != nil && (err == nil || !errors.Is(err, net.ErrClosed)) {
+	if err == nil || !errors.Is(err, net.ErrClosed) {
 		wc.done()
 	}
 	return err
@@ -107,7 +87,8 @@ func (cfg Config) runParent(ctx context.Context) error {
 	firstChildListeners := make([]net.Listener, 0, len(cfg.Addresses))
 
 	var lock sync.RWMutex
-	childForwarders := make([]*forwarderWg, 0, len(cfg.Addresses))
+	childClosing := false
+	childForwarders := make([]forwarder, 0, len(cfg.Addresses))
 	childClose := func() error {
 		for _, sl := range firstChildListeners {
 			sl.Close()
@@ -116,9 +97,10 @@ func (cfg Config) runParent(ctx context.Context) error {
 	}
 
 	defer func() {
-		lock.RLock()
+		lock.Lock()
+		childClosing = true
 		childClose()
-		lock.RUnlock()
+		lock.Unlock()
 	}()
 
 	// listen on all provided addresses
@@ -132,30 +114,40 @@ func (cfg Config) runParent(ctx context.Context) error {
 
 		sl := firstChildListener{
 			addr: ln.Addr(),
-			ch:   make(chan firstChildArgs),
+			ch:   make(chan net.Conn),
 		}
 		firstChildListeners = append(firstChildListeners, &sl)
 		i := len(childForwarders)
-		childForwarders = append(childForwarders, &forwarderWg{
-			handle: sl.Forward,
-		})
+		childForwarders = append(childForwarders, sl.Forward)
 
 		wgChildrenListeners.Add(1) // for the listener
 		go func() {
+			defer wgChildrenListeners.Done() // for the listener
+
 			for {
+				wgChildrenListeners.Add(1) // per connection
+
 				rw, err := ln.Accept()
-				fmt.Println("Accept", err)
-
-				lock.RLock()
-				forwarder := childForwarders[i]
-				lock.RUnlock()
-
-				forwarder.goHandle(&wgChildrenListeners, rw, err)
 
 				// no point continuing if the err is net.ErrClosed
 				if err != nil && errors.Is(err, net.ErrClosed) {
-					wgChildrenListeners.Done() // for the listener
+					wgChildrenListeners.Done() // per connection
 					return
+				}
+				if err != nil {
+					cfg.handleErr("Accept", err)
+				}
+
+				lock.RLock()
+				isClosing := childClosing
+				forward := childForwarders[i]
+				lock.RUnlock()
+
+				if !isClosing {
+					go forward(wgCloser{
+						Conn: rw,
+						done: wgChildrenListeners.Done,
+					})
 				}
 			}
 		}()
@@ -195,7 +187,7 @@ func (cfg Config) runParent(ctx context.Context) error {
 	}
 }
 
-func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarderWg, func() error, error) {
+func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]forwarder, func() error, error) {
 	decoder := json.NewDecoder(rw)
 	var req ChildRequest
 	err := decoder.Decode(&req)
@@ -211,24 +203,20 @@ func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarderWg, fun
 		return nil, nil, errors.New(msg)
 	}
 
-	forwarders := make([]*forwarderWg, 0, len(cfg.Addresses))
+	forwarders := make([]forwarder, 0, len(cfg.Addresses))
 	for _, a := range req.Addresses {
 		addr := a
-		forwarders = append(forwarders, &forwarderWg{
-			handle: func(cliConn net.Conn, err error) {
-				if err != nil {
-					return
-				}
-				srvConn, err := cfg.Dialer.Dial(addr)
-				if err != nil {
-					cliConn.Close()
-					cfg.handleErr(addr, err)
-					return
-				}
+		forwarders = append(forwarders, func(cliConn net.Conn) {
+			srvConn, err := cfg.Dialer.Dial(addr)
+			if err != nil {
+				cliConn.Close()
+				cfg.handleErr(addr, err)
+				return
+			}
 
-				go proxy(srvConn, cliConn)
-			},
-		})
+			go proxy(srvConn, cliConn)
+		},
+		)
 	}
 
 	// keepalive
@@ -286,7 +274,6 @@ func (cfg Config) runChild(ctx context.Context, rw io.ReadWriteCloser) error {
 				break
 			}
 		}
-		fmt.Println("child: closing")
 		for _, ln := range listeners {
 			ln.Close()
 		}

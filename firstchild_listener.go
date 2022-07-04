@@ -1,15 +1,18 @@
 package risefront
 
-import "net"
+import (
+	"net"
+	"sync"
+)
 
 type firstChildArgs struct {
 	conn net.Conn
 	err  error
 }
 type firstChildListener struct {
-	addr  net.Addr
-	ch    chan firstChildArgs
-	close func() error
+	addr      net.Addr
+	ch        chan firstChildArgs
+	closeOnce *sync.Once
 }
 
 func (sl firstChildListener) Forward(conn net.Conn, err error) {
@@ -20,7 +23,10 @@ func (sl firstChildListener) Forward(conn net.Conn, err error) {
 }
 
 func (sl firstChildListener) Accept() (net.Conn, error) {
-	a := <-sl.ch
+	a, ok := <-sl.ch
+	if !ok {
+		return nil, net.ErrClosed
+	}
 	return a.conn, a.err
 }
 
@@ -28,9 +34,9 @@ func (sl firstChildListener) Addr() net.Addr {
 	return sl.addr
 }
 func (sl firstChildListener) Close() error {
-	if sl.close != nil {
-		return sl.close()
-	}
+	sl.closeOnce.Do(func() {
+		close(sl.ch)
+	})
 	return nil
 }
 

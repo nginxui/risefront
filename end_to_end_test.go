@@ -2,6 +2,7 @@ package risefront
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -20,17 +21,13 @@ func TestMain(m *testing.M) {
 		// Normal test mode
 		os.Exit(m.Run())
 
-	case "parent":
-		// cfg := Config{
-		// 	// SocketPrefix: "testing-",
-		// 	Addresses: []string{"8888"},
-		// 	Run: func(l []net.Listener) error {
-		// 		fmt.Println("LISTENT", l)
-		// 		return nil
-		// 	},
-		// }
-		// New(cfg)
-		// TODO call equivalent of main
+	case "dangling-risefront.sock":
+		_, err := net.Listen("unix", "risefront.sock")
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+		os.Exit(0) // exit without closing listener
 	}
 }
 
@@ -54,11 +51,12 @@ func TestEndToEnd(t *testing.T) {
 		And the slow reply.
 	*/
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	parentDone := make(chan struct{})
 	parentReady := make(chan struct{})
+	parentFirstChildDone := make(chan struct{})
 	go func() {
 		errParent := New(ctx, Config{
 			Addresses: []string{testAddr},
@@ -68,13 +66,14 @@ func TestEndToEnd(t *testing.T) {
 
 				s := http.Server{
 					Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-						t.Log("request", r.URL.Path)
+						t.Log("request parent", r.URL.Path)
 						w.Write([]byte("hello world"))
 					}),
 				}
 				defer s.Shutdown(context.Background())
 				err := s.Serve(l[0])
-				t.Log("Serve", err)
+				t.Log("parentFirstChild.Serve", err)
+				close(parentFirstChildDone)
 				return nil
 			},
 		})
@@ -93,6 +92,54 @@ func TestEndToEnd(t *testing.T) {
 	got, err := io.ReadAll(resp.Body)
 	assert.NilError(t, err)
 	assert.Equal(t, "hello world", string(got))
+	err = resp.Body.Close()
+	assert.NilError(t, err)
+
+	// create child
+
+	childDone := make(chan struct{})
+	childReady := make(chan struct{})
+	go func() {
+		errChild := New(ctx, Config{
+			Addresses: []string{testAddr},
+			Run: func(l []net.Listener) error {
+				assert.Equal(t, 1, len(l))
+				close(childReady)
+				t.Log("CHILD READY")
+
+				s := http.Server{
+					Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						t.Log("request child", r.URL.Path)
+						w.Write([]byte("hello child"))
+					}),
+				}
+				defer s.Shutdown(context.Background())
+				err := s.Serve(l[0])
+				t.Log("child.Serve", err)
+				return nil
+			},
+		})
+		assert.NilError(t, errChild)
+		close(childDone)
+	}()
+
+	select {
+	case <-childReady:
+	case <-time.After(time.Second):
+		t.Error("child took too long to be ready")
+	}
+
+	select {
+	case <-parentFirstChildDone:
+	case <-time.After(time.Second):
+		t.Error("parent first child took too long to close")
+	}
+
+	resp, err = http.Get("http://" + testAddr)
+	assert.NilError(t, err)
+	got, err = io.ReadAll(resp.Body)
+	assert.NilError(t, err)
+	assert.Equal(t, "hello child", string(got))
 	err = resp.Body.Close()
 	assert.NilError(t, err)
 
@@ -175,6 +222,43 @@ func TestFirstChildSlowRequest(t *testing.T) {
 		t.Error("response took too long")
 	}
 
+	select {
+	case <-parentDone:
+	case <-time.After(2 * time.Second):
+		t.Error("parent took too long to shutdown")
+	}
+}
+
+func TestExistingSocket(t *testing.T) {
+	os.Remove("risefront.sock")
+	cmd := selfCmd("dangling-risefront.sock")
+	out, err := cmd.CombinedOutput()
+	assert.NilError(t, err, string(out))
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	parentDone := make(chan struct{})
+	parentReady := make(chan struct{})
+	go func() {
+		errParent := New(ctx, Config{
+			Addresses: []string{testAddr},
+			Run: func(l []net.Listener) error {
+				assert.Equal(t, 1, len(l))
+				close(parentReady)
+				return nil
+			},
+		})
+		assert.NilError(t, errParent)
+		close(parentDone)
+	}()
+
+	select {
+	case <-parentReady:
+	case <-time.After(time.Second):
+		t.Error("parent took too long to be ready")
+	}
+	cancel()
 	select {
 	case <-parentDone:
 	case <-time.After(2 * time.Second):

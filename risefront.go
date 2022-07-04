@@ -10,7 +10,6 @@ import (
 	"io"
 	"io/fs"
 	"net"
-	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -206,8 +205,7 @@ func (cfg Config) runInternalListener(connCh chan net.Conn, forwarderCh chan *fo
 }
 
 func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarder, error) {
-	r := io.TeeReader(rw, os.Stdout)
-	decoder := json.NewDecoder(r)
+	decoder := json.NewDecoder(rw)
 	var req ChildRequest
 	err := decoder.Decode(&req)
 	if err != nil {
@@ -229,8 +227,10 @@ func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarder, error
 		addr := a
 		forwarders = append(forwarders, &forwarder{
 			handle: func(cliConn net.Conn) {
+				wgClose.Add(1)
 				go func() {
 					srvConn, err := cfg.Dialer.Dial(addr)
+					wgClose.Done()
 					if err != nil {
 						cliConn.Close()
 						cfg.handleErr(addr, err)
@@ -245,7 +245,7 @@ func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarder, error
 
 	// keepalive
 	go func() {
-		t := time.NewTicker(time.Second)
+		t := time.NewTicker(5 * time.Second)
 		defer t.Stop()
 		for range t.C {
 			_, err := rw.Write([]byte{0})

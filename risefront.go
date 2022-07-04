@@ -2,14 +2,15 @@ package risefront
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"math/rand"
 	"net"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -201,7 +202,8 @@ func (cfg Config) runParent(ctx context.Context) error {
 }
 
 func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarder, error) {
-	decoder := json.NewDecoder(rw)
+	r := io.TeeReader(rw, os.Stdout)
+	decoder := json.NewDecoder(r)
 	var req ChildRequest
 	err := decoder.Decode(&req)
 	if err != nil {
@@ -223,14 +225,15 @@ func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarder, error
 		addr := a
 		forwarders = append(forwarders, &forwarder{
 			handle: func(cliConn net.Conn) {
-				srvConn, err := cfg.Dialer.Dial(addr)
-				if err != nil {
-					cliConn.Close()
-					cfg.handleErr(addr, err)
-					return
-				}
-
-				go proxy(srvConn, cliConn)
+				go func() {
+					srvConn, err := cfg.Dialer.Dial(addr)
+					if err != nil {
+						cliConn.Close()
+						cfg.handleErr(addr, err)
+						return
+					}
+					proxy(srvConn, cliConn)
+				}()
 			},
 			close: wgClose.Done,
 		})
@@ -302,7 +305,10 @@ func (cfg Config) runChild(ctx context.Context, rw io.ReadWriteCloser) error {
 		}
 	}()
 
-	return cfg.Run(listeners)
+	if err := cfg.Run(listeners); errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return nil
 }
 
 // https://stackoverflow.com/a/46909816/3207406

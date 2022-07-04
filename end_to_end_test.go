@@ -68,7 +68,8 @@ func TestEndToEnd(t *testing.T) {
 				s := http.Server{
 					Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 						t.Log("request parent", r.URL.Path)
-						w.Write([]byte("hello world"))
+						_, err := w.Write([]byte("hello world"))
+						assert.NilError(t, err)
 					}),
 				}
 				defer s.Shutdown(context.Background())
@@ -111,7 +112,8 @@ func TestEndToEnd(t *testing.T) {
 				s := http.Server{
 					Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 						t.Log("request child", r.URL.Path)
-						w.Write([]byte("hello child"))
+						_, err := w.Write([]byte("hello child"))
+						assert.NilError(t, err)
 					}),
 				}
 				defer s.Shutdown(context.Background())
@@ -172,13 +174,15 @@ func TestFirstChildSlowRequest(t *testing.T) {
 				s := http.Server{
 					Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 						t.Log("request", r.URL.Path)
-						w.Write([]byte("hello"))
+						_, err := w.Write([]byte("hello"))
+						assert.NilError(t, err)
 
 						if r.URL.Path == "/close" {
 							cancel()
 							time.Sleep(100 * time.Millisecond)
 						}
-						w.Write([]byte(" world"))
+						_, err = w.Write([]byte(" world"))
+						assert.NilError(t, err)
 						t.Log("replied")
 						atomic.AddUint32(&handlerCalled, 1)
 					}),

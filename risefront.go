@@ -261,6 +261,7 @@ func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarder, error
 		rw.Close()
 	}()
 
+	fmt.Println(req.Addresses)
 	return forwarders, nil
 }
 

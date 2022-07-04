@@ -2,6 +2,7 @@ package risefront
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -77,7 +78,7 @@ func TestEndToEnd(t *testing.T) {
 				return nil
 			},
 		})
-		assert.NilError(t, errParent)
+		assert.Check(t, errors.Is(errParent, context.Canceled))
 		close(parentDone)
 	}()
 
@@ -133,6 +134,7 @@ func TestEndToEnd(t *testing.T) {
 	case <-parentFirstChildDone:
 	case <-time.After(time.Second):
 		t.Error("parent first child took too long to close")
+
 	}
 
 	resp, err = http.Get("http://" + testAddr)
@@ -190,7 +192,7 @@ func TestFirstChildSlowRequest(t *testing.T) {
 		// ensure handler was called twice, before the parent returned
 		assert.Equal(t, uint32(2), atomic.LoadUint32(&handlerCalled))
 
-		assert.NilError(t, errParent)
+		assert.Check(t, errors.Is(errParent, context.Canceled))
 		close(parentDone)
 	}()
 
@@ -246,10 +248,12 @@ func TestExistingSocket(t *testing.T) {
 			Run: func(l []net.Listener) error {
 				assert.Equal(t, 1, len(l))
 				close(parentReady)
+				_, err = l[0].Accept()
+				assert.Check(t, errors.Is(err, net.ErrClosed))
 				return nil
 			},
 		})
-		assert.NilError(t, errParent)
+		assert.Check(t, errors.Is(errParent, context.Canceled))
 		close(parentDone)
 	}()
 

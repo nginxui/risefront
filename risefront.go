@@ -57,6 +57,25 @@ func (cfg Config) handleErr(kind string, err error) {
 
 type forwarder func(net.Conn, error)
 
+type forwarderWg struct {
+	handle func(net.Conn, error)
+}
+
+func (f *forwarderWg) goHandle(wg *sync.WaitGroup, c net.Conn, err error) {
+	if err != nil {
+		fmt.Println("forwarding-err")
+		f.handle(nil, err)
+		return
+	}
+
+	wg.Add(1)
+	fmt.Println("forwarding")
+	f.handle(wgCloser{
+		Conn: c,
+		done: wg.Done,
+	}, err)
+}
+
 type wgCloser struct {
 	net.Conn
 	done func()
@@ -88,11 +107,12 @@ func (cfg Config) runParent(ctx context.Context) error {
 	firstChildListeners := make([]net.Listener, 0, len(cfg.Addresses))
 
 	var lock sync.RWMutex
-	childForwarders := make([]forwarder, 0, len(cfg.Addresses))
-	childClose := func() {
-		for _, ln := range firstChildListeners {
-			ln.Close()
+	childForwarders := make([]*forwarderWg, 0, len(cfg.Addresses))
+	childClose := func() error {
+		for _, sl := range firstChildListeners {
+			sl.Close()
 		}
+		return nil
 	}
 
 	defer func() {
@@ -108,38 +128,29 @@ func (cfg Config) runParent(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		// defer ln.Close()
+		defer ln.Close()
 
 		sl := firstChildListener{
-			addr:      ln.Addr(),
-			ch:        make(chan firstChildArgs),
-			closeOnce: &sync.Once{},
+			addr: ln.Addr(),
+			ch:   make(chan firstChildArgs),
 		}
-		firstChildListeners = append(firstChildListeners, sl)
+		firstChildListeners = append(firstChildListeners, &sl)
 		i := len(childForwarders)
-		childForwarders = append(childForwarders, sl.Forward)
+		childForwarders = append(childForwarders, &forwarderWg{
+			handle: sl.Forward,
+		})
 
 		wgChildrenListeners.Add(1) // for the listener
 		go func() {
 			for {
-				wgChildrenListeners.Add(1) // for the connection
 				rw, err := ln.Accept()
 				fmt.Println("Accept", err)
 
-				done := wgChildrenListeners.Done
-				if err != nil {
-					done()
-					done = nil
-				}
-
 				lock.RLock()
-				forward := childForwarders[i]
+				forwarder := childForwarders[i]
 				lock.RUnlock()
 
-				go forward(wgCloser{
-					Conn: rw,
-					done: done,
-				}, err)
+				forwarder.goHandle(&wgChildrenListeners, rw, err)
 
 				// no point continuing if the err is net.ErrClosed
 				if err != nil && errors.Is(err, net.ErrClosed) {
@@ -175,14 +186,16 @@ func (cfg Config) runParent(ctx context.Context) error {
 		}
 
 		lock.Lock()
-		childClose()
+		previousCloser := childClose
 		childForwarders = newForwarders
 		childClose = newChildClose
 		lock.Unlock()
+
+		go previousCloser()
 	}
 }
 
-func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]forwarder, func(), error) {
+func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarderWg, func() error, error) {
 	decoder := json.NewDecoder(rw)
 	var req ChildRequest
 	err := decoder.Decode(&req)
@@ -198,39 +211,39 @@ func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]forwarder, func()
 		return nil, nil, errors.New(msg)
 	}
 
-	forwarders := make([]forwarder, 0, len(cfg.Addresses))
+	forwarders := make([]*forwarderWg, 0, len(cfg.Addresses))
 	for _, a := range req.Addresses {
 		addr := a
-		forwarders = append(forwarders, func(cliConn net.Conn, err error) {
-			if err != nil {
-				return
-			}
-			srvConn, err := cfg.Dialer.Dial(addr)
-			if err != nil {
-				cfg.handleErr(addr, err)
-				return
-			}
+		forwarders = append(forwarders, &forwarderWg{
+			handle: func(cliConn net.Conn, err error) {
+				if err != nil {
+					return
+				}
+				srvConn, err := cfg.Dialer.Dial(addr)
+				if err != nil {
+					cliConn.Close()
+					cfg.handleErr(addr, err)
+					return
+				}
 
-			proxy(srvConn, cliConn)
+				go proxy(srvConn, cliConn)
+			},
 		})
 	}
 
-	done := make(chan struct{})
+	// keepalive
 	go func() {
 		t := time.NewTicker(time.Second)
 		defer t.Stop()
-		for {
-			select {
-			case <-done:
-				rw.Close()
+		for range t.C {
+			_, err := rw.Write([]byte{0})
+			if err != nil {
 				return
-			case <-t.C:
-				rw.Write([]byte{0})
 			}
 		}
 	}()
 
-	return forwarders, func() { close(done) }, nil
+	return forwarders, rw.Close, nil
 }
 
 func (cfg Config) runChild(ctx context.Context, rw io.ReadWriteCloser) error {

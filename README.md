@@ -1,6 +1,6 @@
 # risefront
 
-[![Go Reference](https://pkg.go.dev/badge/codeberg.org/oliverpool/risefront.svg)](https://pkg.go.dev/codeberg.org/oliverpool/risefront)
+[![Go Reference](https://pkg.go.dev/badge/code.pfad.fr/risefront.svg)](https://pkg.go.dev/code.pfad.fr/risefront)
 
 `risefront` is a package for gracefully upgrading the server behing a tcp connection, without disturbing running transfers or dropping incoming requests.
 

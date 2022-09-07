@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"time"
 
-	"codeberg.org/oliverpool/risefront"
+	"code.pfad.fr/risefront"
 )
 
 func main() {

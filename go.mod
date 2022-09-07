@@ -1,4 +1,4 @@
-module codeberg.org/oliverpool/risefront
+module code.pfad.fr/risefront
 
 go 1.18
 

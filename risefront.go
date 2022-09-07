@@ -9,32 +9,43 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"net"
 	"strconv"
 	"sync"
 	"time"
 )
 
+// Dialer is used for the child-parent communication.
 type Dialer interface {
 	Listen(name string) (net.Listener, error)
 	Dial(name string) (net.Conn, error)
 }
 
 type Config struct {
-	Dialer    Dialer // let empty for default dialer
-	Network   string // "tcp" (default), "tcp4", "tcp6", "unix" or "unixpacket"
-	Addresses []string
+	Addresses []string                   // Addresses to listen to.
+	Run       func([]net.Listener) error // Handle the connections. All running connections should be closed before returning (srv.Shutdown for http.Server for instance).
 
-	Run          func([]net.Listener) error // all running connections should be closed before returning (srv.Shutdown for http.Server for instance)
-	ErrorHandler func(string, error)
+	Dialer       Dialer              // Dialer for child-parent communication. Let empty for default dialer (PrefixDialer{}).
+	Network      string              // "tcp" (default if empty), "tcp4", "tcp6", "unix" or "unixpacket"
+	ErrorHandler func(string, error) // print to stdout if empty
 }
 
+// New calls Run with working listeners.
+//
+//   - if no other instance of risefront is found running, it will actually listen on the given addresses.
+//   - if a parent instance of risefront is found running, it will ask this parent to forward all new connections.
 func New(ctx context.Context, cfg Config) error {
 	if cfg.Dialer == nil {
 		cfg.Dialer = PrefixDialer{}
 	}
 	if cfg.Network == "" {
 		cfg.Network = "tcp"
+	}
+	if cfg.ErrorHandler == nil {
+		cfg.ErrorHandler = func(kind string, err error) {
+			log.Println(kind, err)
+		}
 	}
 	c, err := cfg.Dialer.Dial("risefront.sock")
 	if err != nil {
@@ -45,13 +56,6 @@ func New(ctx context.Context, cfg Config) error {
 	}
 
 	return cfg.runChild(c)
-}
-
-func (cfg Config) handleErr(kind string, err error) {
-	fmt.Println(kind, err)
-	if cfg.ErrorHandler != nil {
-		cfg.ErrorHandler(kind, err)
-	}
 }
 
 type forwarder struct {
@@ -132,7 +136,7 @@ func (cfg Config) runParent(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			cfg.handleErr("parent.sock.Accept", err)
+			cfg.ErrorHandler("parent.sock.Accept", err)
 			if ne, ok := err.(net.Error); ok && ne.Timeout() { //nolint: errorlint
 				time.Sleep(5 * time.Millisecond)
 				continue
@@ -142,7 +146,7 @@ func (cfg Config) runParent(ctx context.Context) error {
 
 		newForwarders, err := cfg.handleChildRequest(rw)
 		if err != nil {
-			cfg.handleErr("child.Request", err)
+			cfg.ErrorHandler("child.Request", err)
 			continue
 		}
 
@@ -158,7 +162,7 @@ func (cfg Config) runExternalListener(ln net.Listener, ch chan net.Conn) {
 		rw, err := ln.Accept()
 
 		if err != nil {
-			cfg.handleErr("parent.external.Accept", err)
+			cfg.ErrorHandler("parent.external.Accept", err)
 			if ne, ok := err.(net.Error); ok && ne.Timeout() { //nolint: errorlint
 				time.Sleep(5 * time.Millisecond)
 				continue
@@ -206,7 +210,7 @@ func (cfg Config) runInternalListener(connCh chan net.Conn, forwarderCh chan *fo
 
 func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarder, error) {
 	decoder := json.NewDecoder(rw)
-	var req ChildRequest
+	var req childRequest
 	err := decoder.Decode(&req)
 	if err != nil {
 		rw.Close()
@@ -233,7 +237,7 @@ func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarder, error
 					wgClose.Done()
 					if err != nil {
 						cliConn.Close()
-						cfg.handleErr(addr, err)
+						cfg.ErrorHandler(addr, err)
 						return
 					}
 					proxy(srvConn, cliConn)
@@ -294,8 +298,7 @@ func (cfg Config) runChild(rw io.ReadWriteCloser) error {
 		addresses = append(addresses, name)
 	}
 
-	encoder := json.NewEncoder(rw)
-	err = encoder.Encode(ChildRequest{
+	err = json.NewEncoder(rw).Encode(childRequest{
 		Addresses: addresses,
 	})
 	if err != nil {
@@ -330,6 +333,6 @@ func randomPrefix(n int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-type ChildRequest struct {
+type childRequest struct {
 	Addresses []string `json:"addresses"`
 }

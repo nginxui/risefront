@@ -63,6 +63,8 @@ func New(ctx context.Context, cfg Config) error {
 	return cfg.runChild(c)
 }
 
+// forwarder is used to forward a incoming net.Conn to another actual handler.
+// Either local (in parent case) or via a Dialer (in child case).
 type forwarder struct {
 	handle func(net.Conn)
 	close  func()

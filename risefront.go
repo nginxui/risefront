@@ -26,15 +26,20 @@ type Config struct {
 	Addresses []string                   // Addresses to listen to.
 	Run       func([]net.Listener) error // Handle the connections. All running connections should be closed before returning (srv.Shutdown for http.Server for instance).
 
-	Dialer       Dialer              // Dialer for child-parent communication. Let empty for default dialer (PrefixDialer{}).
-	Network      string              // "tcp" (default if empty), "tcp4", "tcp6", "unix" or "unixpacket"
-	ErrorHandler func(string, error) // print to stdout if empty
+	Dialer       Dialer                       // Dialer for child-parent communication. Let empty for default dialer (PrefixDialer{}).
+	Network      string                       // "tcp" (default if empty), "tcp4", "tcp6", "unix" or "unixpacket"
+	ErrorHandler func(kind string, err error) // Where errors should be logged (print to stderr by default)
+
+	_ struct{} // to later add fields without break compatibility.
 }
 
-// New calls Run with working listeners.
+// New calls cfg.Run with opened listeners.
 //
 //   - if no other instance of risefront is found running, it will actually listen on the given addresses.
 //   - if a parent instance of risefront is found running, it will ask this parent to forward all new connections.
+//
+// The parent will live as long as the context lives.
+// The child will live as long as the parent is alive and no other child has been started.
 func New(ctx context.Context, cfg Config) error {
 	if cfg.Dialer == nil {
 		cfg.Dialer = PrefixDialer{}
@@ -162,7 +167,7 @@ func (cfg Config) runExternalListener(ln net.Listener, ch chan net.Conn) {
 		rw, err := ln.Accept()
 
 		if err != nil {
-			cfg.ErrorHandler("parent.external.Accept", err)
+			cfg.ErrorHandler("parent."+ln.Addr().String()+".Accept", err)
 			if ne, ok := err.(net.Error); ok && ne.Timeout() { //nolint: errorlint
 				time.Sleep(5 * time.Millisecond)
 				continue
@@ -237,7 +242,7 @@ func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarder, error
 					wgClose.Done()
 					if err != nil {
 						cliConn.Close()
-						cfg.ErrorHandler(addr, err)
+						cfg.ErrorHandler("child."+addr+".Dial", err)
 						return
 					}
 					proxy(srvConn, cliConn)

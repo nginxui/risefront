@@ -26,7 +26,7 @@ type Dialer interface {
 
 type Config struct {
 	Addresses []string                   // Addresses to listen to.
-	Run       func([]net.Listener) error // Handle the connections. All running connections should be closed before returning (srv.Shutdown for http.Server for instance).
+	Run       func([]net.Listener) error // Handle the connections. All open connections should be properly closed before returning (srv.Shutdown for http.Server for instance).
 
 	Dialer       Dialer                       // Dialer for child-parent communication. Let empty for default dialer (PrefixDialer{}).
 	Network      string                       // "tcp" (default if empty), "tcp4", "tcp6", "unix" or "unixpacket"
@@ -287,7 +287,7 @@ func (cfg Config) runChild(rw io.ReadWriteCloser) error {
 	if err != nil {
 		return err
 	}
-	prefix = "child-" + prefix + "-"
+	prefix = "risechild-" + prefix + "-"
 	for i := range cfg.Addresses {
 		name := prefix + strconv.Itoa(i) + ".sock"
 
@@ -327,8 +327,8 @@ func (cfg Config) runChild(rw io.ReadWriteCloser) error {
 		}
 	}()
 
-	if err := cfg.Run(listeners); errors.Is(err, net.ErrClosed) {
-		return nil
+	if err := cfg.Run(listeners); !errors.Is(err, net.ErrClosed) {
+		return err
 	}
 	return nil
 }

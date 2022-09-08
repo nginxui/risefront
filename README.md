@@ -2,7 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/code.pfad.fr/risefront.svg)](https://pkg.go.dev/code.pfad.fr/risefront)
 
-`code.pfad.fr/risefront` is a package for gracefully upgrading the server behing a tcp connection, without disturbing running transfers or dropping incoming requests.
+`code.pfad.fr/risefront` is a package for gracefully upgrading the server behing a tcp connection with zero-downtime (without disturbing running transfers or dropping incoming requests).
 
 The name is meant to be the opposite of fallback (since it switches to a new executable when asked to do so).
 

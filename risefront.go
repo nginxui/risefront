@@ -1,3 +1,5 @@
+// package risefront enables gracefully upgrading the server behing a tcp connection with zero-downtime
+// (without disturbing running transfers or dropping incoming requests).
 package risefront
 
 import (

@@ -1,0 +1,16 @@
+# Alpine 3.16 has go 1.18, which does not support json specification https://alpinelinux.org/releases/
+image: alpine/3.17
+oauth: pages.sr.ht/PAGES:RW
+packages:
+  - go
+environment:
+  module: risefront
+tasks:
+  - build: |
+      cd $module && go list -json="Dir,ImportPath,Doc,Module" ./... | go run code.pfad.fr/vanitydoc@latest -html=dist/html -gemtext=dist/gmi
+  - deploy-html: |
+      tar -C $module/dist/html -cvz . > html.tar.gz
+      acurl -f https://pages.sr.ht/publish/code.pfad.fr/$module -Fcontent=@html.tar.gz
+  - deploy-gmi: |
+      tar -C $module/dist/gmi -cvz . > gmi.tar.gz
+      acurl -f https://pages.sr.ht/publish/code.pfad.fr/$module -Fcontent=@gmi.tar.gz -Fprotocol=GEMINI

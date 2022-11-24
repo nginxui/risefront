@@ -1,5 +1,5 @@
 # Alpine 3.16 has go 1.18, which does not support json specification https://alpinelinux.org/releases/
-image: alpine/3.17
+image: alpine/edge
 oauth: pages.sr.ht/PAGES:RW
 packages:
   - go

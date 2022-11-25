@@ -8,7 +8,7 @@ environment:
   forge: gitea://codeberg.org/pfad.fr/risefront
 tasks:
   - build: |
-      cd $module && go list -json="Dir,ImportPath,Doc,Module" ./... | go run code.pfad.fr/vanitydoc@v0.3.1 -html=dist/html -gemtext=dist/gmi $forge
+      cd $module && go list -json="Dir,ImportPath,Doc,Module" ./... | go run code.pfad.fr/vanitydoc@latest -html=dist/html -gemtext=dist/gmi $forge
   - deploy-html: |
       tar -C $module/dist/html -cvz . > html.tar.gz
       acurl -f https://pages.sr.ht/publish/code.pfad.fr/$module -Fcontent=@html.tar.gz

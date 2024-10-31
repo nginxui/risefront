@@ -108,30 +108,37 @@ func (cfg Config) runParent(ctx context.Context) error {
 	}
 	go func() {
 		<-ctx.Done()
-		lnChild.Close()
+		_ = lnChild.Close()
 	}()
-	defer lnChild.Close()
+	defer func(lnChild net.Listener) {
+		_ = lnChild.Close()
+	}(lnChild)
 
 	var wgInternalListeners sync.WaitGroup
 	defer wgInternalListeners.Wait()
 
 	firstChildListeners := make([]net.Listener, 0, len(cfg.Addresses))
 
-	listenOnAddress := func(addr string) (ln net.Listener, err error) {
-		ln, err = net.Listen(cfg.Network, addr)
-		if err == nil {
-			defer ln.Close()
-		}
-		return
-	}
-
 	// listen on all provided addresses and forward to channel
 	forwarderChs := make([]chan *forwarder, 0, len(cfg.Addresses))
+	listeners := make([]net.Listener, 0, len(cfg.Addresses))
+
+	closeListeners := func() {
+		for _, ln := range listeners {
+			err := ln.Close()
+			if err != nil && !errors.Is(err, net.ErrClosed) {
+				cfg.ErrorHandler("parent.sock.Close", err)
+			}
+		}
+	}
+
 	for _, a := range cfg.Addresses {
-		ln, err := listenOnAddress(a)
+		ln, err := net.Listen(cfg.Network, a)
 		if err != nil {
+			closeListeners()
 			return err
 		}
+		listeners = append(listeners, ln)
 
 		// external listener
 		connCh := make(chan net.Conn, 1)
@@ -152,8 +159,15 @@ func (cfg Config) runParent(ctx context.Context) error {
 		go cfg.runInternalListener(connCh, forwarderCh, &sl, wgInternalListeners.Done)
 	}
 
+	defer closeListeners()
+
 	// All set, run first child
-	go cfg.Run(firstChildListeners) //nolint:errcheck
+	go func() {
+		err := cfg.Run(firstChildListeners)
+		if err != nil {
+			cfg.ErrorHandler("parent.Run", err)
+		}
+	}()
 
 	// listen for new children
 	for {
@@ -207,7 +221,7 @@ func (cfg Config) runInternalListener(connCh chan net.Conn, forwarderCh chan *fo
 	fw := &forwarder{
 		handle: sl.Forward,
 		close: func() {
-			sl.Close()
+			_ = sl.Close()
 		},
 	}
 	for {
@@ -241,14 +255,14 @@ func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarder, error
 	var req childRequest
 	err := decoder.Decode(&req)
 	if err != nil {
-		rw.Close()
+		_ = rw.Close()
 		return nil, err
 	}
 	if len(req.Addresses) != len(cfg.Addresses) {
 		msg := fmt.Sprintf("wrong number of addresses, got %d, expected %d", len(req.Addresses), len(cfg.Addresses))
-		rw.Write([]byte(msg)) //nolint:errcheck
+		_, _ = rw.Write([]byte(msg))
 
-		rw.Close()
+		_ = rw.Close()
 		return nil, errors.New(msg)
 	}
 
@@ -264,7 +278,7 @@ func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarder, error
 					srvConn, err := cfg.Dialer.Dial(addr)
 					wgClose.Done()
 					if err != nil {
-						cliConn.Close()
+						_ = cliConn.Close()
 						cfg.ErrorHandler("child."+addr+".Dial", err)
 						return
 					}
@@ -290,7 +304,7 @@ func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarder, error
 	// close connection when all forwarders are done
 	go func() {
 		wgClose.Wait()
-		rw.Close()
+		_ = rw.Close()
 	}()
 
 	fmt.Println(req.Addresses)
@@ -298,7 +312,9 @@ func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarder, error
 }
 
 func (cfg Config) runChild(rw io.ReadWriteCloser) error {
-	defer rw.Close()
+	defer func(rw io.ReadWriteCloser) {
+		_ = rw.Close()
+	}(rw)
 
 	listeners := make([]net.Listener, 0, len(cfg.Addresses))
 	addresses := make([]string, 0, len(cfg.Addresses))
@@ -307,12 +323,13 @@ func (cfg Config) runChild(rw io.ReadWriteCloser) error {
 		return err
 	}
 
-	listenOnAddress := func(name string) (ln net.Listener, err error) {
-		ln, err = cfg.Dialer.Listen(name)
-		if err == nil {
-			defer ln.Close()
+	closeListeners := func() {
+		for _, ln := range listeners {
+			err := ln.Close()
+			if err != nil && !errors.Is(err, net.ErrClosed) {
+				cfg.ErrorHandler("child.sock.Close", err)
+			}
 		}
-		return
 	}
 
 	var builder strings.Builder
@@ -330,17 +347,19 @@ func (cfg Config) runChild(rw io.ReadWriteCloser) error {
 
 		// hack to ensure that a dangling socket gets cleaned up before listening
 		if conn, _ := cfg.Dialer.Dial(name); conn != nil {
-			conn.Close()
+			_ = conn.Close()
 		}
 
-		ln, err := listenOnAddress(name)
+		ln, err := cfg.Dialer.Listen(name)
 		if err != nil {
+			closeListeners()
 			return err
 		}
 
 		listeners = append(listeners, ln)
 		addresses = append(addresses, name)
 	}
+	defer closeListeners()
 
 	err = json.NewEncoder(rw).Encode(childRequest{
 		Addresses: addresses,
@@ -357,9 +376,7 @@ func (cfg Config) runChild(rw io.ReadWriteCloser) error {
 				break
 			}
 		}
-		for _, ln := range listeners {
-			ln.Close()
-		}
+		closeListeners()
 	}()
 
 	if err := cfg.Run(listeners); !errors.Is(err, net.ErrClosed) {

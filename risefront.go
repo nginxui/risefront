@@ -1,4 +1,4 @@
-// package risefront enables gracefully upgrading the server behing a tcp connection with zero-downtime
+// Package risefront enables gracefully upgrading the server behing a tcp connection with zero-downtime
 // (without disturbing running transfers or dropping incoming requests).
 package risefront
 
@@ -14,6 +14,7 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -28,6 +29,7 @@ type Config struct {
 	Addresses []string                   // Addresses to listen to.
 	Run       func([]net.Listener) error // Handle the connections. All open connections should be properly closed before returning (srv.Shutdown for http.Server for instance).
 
+	Name         string                       // Name of the socket file
 	Dialer       Dialer                       // Dialer for child-parent communication. Let empty for default dialer (PrefixDialer{}).
 	Network      string                       // "tcp" (default if empty), "tcp4", "tcp6", "unix" or "unixpacket"
 	ErrorHandler func(kind string, err error) // Where errors should be logged (print to stderr by default)
@@ -65,7 +67,7 @@ func New(ctx context.Context, cfg Config) error {
 	return cfg.runChild(c)
 }
 
-// forwarder is used to forward a incoming net.Conn to another actual handler.
+// forwarder is used to forward an incoming net.Conn to another actual handler.
 // Either local (in parent case) or via a Dialer (in child case).
 type forwarder struct {
 	handle func(net.Conn)
@@ -92,7 +94,15 @@ func (wc wgCloser) Close() error {
 }
 
 func (cfg Config) runParent(ctx context.Context) error {
-	lnChild, err := cfg.Dialer.Listen("risefront.sock")
+	var builder strings.Builder
+	if cfg.Name != "" {
+		builder.WriteString(cfg.Name)
+	} else {
+		builder.WriteString("risefront")
+	}
+	builder.WriteString(".sock")
+
+	lnChild, err := cfg.Dialer.Listen(builder.String())
 	if err != nil {
 		return err
 	}
@@ -107,14 +117,21 @@ func (cfg Config) runParent(ctx context.Context) error {
 
 	firstChildListeners := make([]net.Listener, 0, len(cfg.Addresses))
 
+	listenOnAddress := func(addr string) (ln net.Listener, err error) {
+		ln, err = net.Listen(cfg.Network, addr)
+		if err == nil {
+			defer ln.Close()
+		}
+		return
+	}
+
 	// listen on all provided addresses and forward to channel
 	forwarderChs := make([]chan *forwarder, 0, len(cfg.Addresses))
 	for _, a := range cfg.Addresses {
-		ln, err := net.Listen(cfg.Network, a)
+		ln, err := listenOnAddress(a)
 		if err != nil {
 			return err
 		}
-		defer ln.Close()
 
 		// external listener
 		connCh := make(chan net.Conn, 1)
@@ -146,7 +163,8 @@ func (cfg Config) runParent(ctx context.Context) error {
 				return ctx.Err()
 			}
 			cfg.ErrorHandler("parent.sock.Accept", err)
-			if ne, ok := err.(net.Error); ok && ne.Timeout() { //nolint: errorlint
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
 				time.Sleep(5 * time.Millisecond)
 				continue
 			}
@@ -172,7 +190,8 @@ func (cfg Config) runExternalListener(ln net.Listener, ch chan net.Conn) {
 
 		if err != nil {
 			cfg.ErrorHandler("parent."+ln.Addr().String()+".Accept", err)
-			if ne, ok := err.(net.Error); ok && ne.Timeout() { //nolint: errorlint
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
 				time.Sleep(5 * time.Millisecond)
 				continue
 			}
@@ -287,21 +306,37 @@ func (cfg Config) runChild(rw io.ReadWriteCloser) error {
 	if err != nil {
 		return err
 	}
-	prefix = "risechild-" + prefix + "-"
+
+	listenOnAddress := func(name string) (ln net.Listener, err error) {
+		ln, err = cfg.Dialer.Listen(name)
+		if err == nil {
+			defer ln.Close()
+		}
+		return
+	}
+
+	var builder strings.Builder
+	if cfg.Name != "" {
+		builder.WriteString(cfg.Name)
+	} else {
+		builder.WriteString("rise")
+	}
+	builder.WriteString("-child-")
+	builder.WriteString(prefix)
+	builder.WriteString("-")
+
 	for i := range cfg.Addresses {
-		name := prefix + strconv.Itoa(i) + ".sock"
+		name := builder.String() + strconv.Itoa(i) + ".sock"
 
 		// hack to ensure that a dangling socket gets cleaned up before listening
 		if conn, _ := cfg.Dialer.Dial(name); conn != nil {
 			conn.Close()
 		}
 
-		var ln net.Listener
-		ln, err = cfg.Dialer.Listen(name)
+		ln, err := listenOnAddress(name)
 		if err != nil {
 			return err
 		}
-		defer ln.Close()
 
 		listeners = append(listeners, ln)
 		addresses = append(addresses, name)

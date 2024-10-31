@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"strings"
 	"syscall"
 )
 
@@ -19,13 +20,17 @@ func (pd PrefixDialer) Listen(name string) (net.Listener, error) {
 }
 
 func (pd PrefixDialer) Dial(name string) (net.Conn, error) {
-	c, err := dial(pd.Prefix + name)
+	var builder strings.Builder
+	builder.WriteString(pd.Prefix)
+	builder.WriteString(name)
+
+	c, err := dial(builder.String())
 
 	// attempt to remove file if nobofy is listening
 	if err != nil && errorIsNobodyListening(err) {
-		_ = os.Remove(pd.Prefix + name)
+		_ = os.Remove(builder.String())
 		// re-dial to have a nice fs.ErrNotExist error
-		c, err = dial(pd.Prefix + name)
+		c, err = dial(builder.String())
 	}
 
 	return c, err
@@ -34,7 +39,7 @@ func (pd PrefixDialer) Dial(name string) (net.Conn, error) {
 func errorIsNobodyListening(err error) bool {
 	sysErr := &os.SyscallError{}
 	if errors.As(err, &sysErr) {
-		return sysErr.Syscall == "connect" && sysErr.Err == syscall.Errno(111) //nolint:errorlint
+		return sysErr.Syscall == "connect" && errors.Is(sysErr.Err, syscall.Errno(111))
 	}
 	return false
 }

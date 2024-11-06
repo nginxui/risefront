@@ -56,12 +56,21 @@ func New(ctx context.Context, cfg Config) error {
 			log.Println(kind, err)
 		}
 	}
-	c, err := cfg.Dialer.Dial("risefront.sock")
+
+	var builder strings.Builder
+	if cfg.Name != "" {
+		builder.WriteString(cfg.Name)
+	} else {
+		builder.WriteString("risefront")
+	}
+	builder.WriteString(".sock")
+
+	c, err := cfg.Dialer.Dial(builder.String())
 	if err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
-		return cfg.runParent(ctx)
+		return cfg.runParent(ctx, builder.String())
 	}
 
 	return cfg.runChild(c)
@@ -93,16 +102,8 @@ func (wc wgCloser) Close() error {
 	return err
 }
 
-func (cfg Config) runParent(ctx context.Context) error {
-	var builder strings.Builder
-	if cfg.Name != "" {
-		builder.WriteString(cfg.Name)
-	} else {
-		builder.WriteString("risefront")
-	}
-	builder.WriteString(".sock")
-
-	lnChild, err := cfg.Dialer.Listen(builder.String())
+func (cfg Config) runParent(ctx context.Context, socket string) error {
+	lnChild, err := cfg.Dialer.Listen(socket)
 	if err != nil {
 		return err
 	}

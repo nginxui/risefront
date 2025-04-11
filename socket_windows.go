@@ -2,9 +2,11 @@
 
 package risefront
 
-import "net"
+import (
+	"net"
 
-import "github.com/Microsoft/go-winio"
+	"github.com/Microsoft/go-winio"
+)
 
 func listen(name string) (net.Listener, error) {
 	return winio.ListenPipe(`\\.\pipe\`+name, nil)

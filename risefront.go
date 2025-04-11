@@ -13,10 +13,19 @@ import (
 	"io/fs"
 	"log"
 	"net"
+	"os"
+	"os/exec"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+)
+
+// 存储全局配置和监听器，用于Restart函数
+var (
+	globalConfig    Config
+	globalListeners []net.Listener
 )
 
 // Dialer is used for the child-parent communication.
@@ -29,10 +38,12 @@ type Config struct {
 	Addresses []string                   // Addresses to listen to.
 	Run       func([]net.Listener) error // Handle the connections. All open connections should be properly closed before returning (srv.Shutdown for http.Server for instance).
 
-	Name         string                       // Name of the socket file
-	Dialer       Dialer                       // Dialer for child-parent communication. Let empty for default dialer (PrefixDialer{}).
-	Network      string                       // "tcp" (default if empty), "tcp4", "tcp6", "unix" or "unixpacket"
-	ErrorHandler func(kind string, err error) // Where errors should be logged (print to stderr by default)
+	Name          string                       // Name of the socket file
+	Dialer        Dialer                       // Dialer for child-parent communication. Let empty for default dialer (PrefixDialer{}).
+	Network       string                       // "tcp" (default if empty), "tcp4", "tcp6", "unix" or "unixpacket"
+	ErrorHandler  func(kind string, err error) // Where errors should be logged (print to stderr by default)
+	RestartSignal os.Signal                    // Signal to trigger a restart
+	NoRestart     bool                         // Disables all restarts
 
 	_ struct{} // to later add fields without break compatibility.
 }
@@ -41,10 +52,24 @@ type Config struct {
 //
 //   - if no other instance of risefront is found running, it will actually listen on the given addresses.
 //   - if a parent instance of risefront is found running, it will ask this parent to forward all new connections.
+//   - if migrating from overseer, will automatically detect and use overseer's file descriptors.
 //
 // The parent will live as long as the context lives.
 // The child will live as long as the parent is alive and no other child has been started.
 func New(ctx context.Context, cfg Config) error {
+	// Save the global configuration for use in Restart
+	globalConfig = cfg
+
+	// First, try to get file descriptors from overseer
+	if listeners, err := FromOverseerFDs(); err != nil {
+		return err
+	} else if len(listeners) > 0 {
+		// Listen for signals and pass the listeners to the child process
+		globalListeners = listeners
+		WatchOverseerSignal(cfg.RestartSignal, listeners)
+		return cfg.Run(listeners)
+	}
+
 	if cfg.Dialer == nil {
 		cfg.Dialer = PrefixDialer{}
 	}
@@ -55,6 +80,9 @@ func New(ctx context.Context, cfg Config) error {
 		cfg.ErrorHandler = func(kind string, err error) {
 			log.Println(kind, err)
 		}
+	}
+	if cfg.RestartSignal == nil {
+		cfg.RestartSignal = SIGUSR1
 	}
 
 	var builder strings.Builder
@@ -124,6 +152,9 @@ func (cfg Config) runParent(ctx context.Context, socket string) error {
 	forwarderChs := make([]chan *forwarder, 0, len(cfg.Addresses))
 	listeners := make([]net.Listener, 0, len(cfg.Addresses))
 
+	// Save the global listeners for use in Restart
+	globalListeners = listeners
+
 	closeListeners := func() {
 		for _, ln := range listeners {
 			err := ln.Close()
@@ -131,6 +162,22 @@ func (cfg Config) runParent(ctx context.Context, socket string) error {
 				cfg.ErrorHandler("parent.sock.Close", err)
 			}
 		}
+	}
+
+	// Set up the restart signal processor
+	if !cfg.NoRestart {
+		restartCh := make(chan os.Signal, 1)
+		signal.Notify(restartCh, cfg.RestartSignal)
+		go func() {
+			for range restartCh {
+				cfg.ErrorHandler("parent", errors.New("restart signal received, starting new child process"))
+				err := cfg.createChild(listeners)
+				if err != nil {
+					cfg.ErrorHandler("parent.createChild", err)
+					continue
+				}
+			}
+		}()
 	}
 
 	for _, a := range cfg.Addresses {
@@ -397,4 +444,59 @@ func randomPrefix(n int) (string, error) {
 
 type childRequest struct {
 	Addresses []string `json:"addresses"`
+}
+
+// Restart creates a child process instead of sending a signal
+func Restart() {
+	if len(globalListeners) == 0 {
+		log.Println("Unable to restart: no valid listeners found")
+		return
+	}
+
+	err := globalConfig.createChild(globalListeners)
+	if err != nil {
+		log.Printf("Restart failed: %v", err)
+	}
+}
+
+// createChild creates a child process with the specified listeners
+func (cfg Config) createChild(listeners []net.Listener) error {
+	// Get the executable file path of the current program
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("failed to get executable path: %v", err)
+	}
+
+	// Create the child process
+	cmd := exec.Command(executable)
+
+	// Inherit the current process's environment variables
+	cmd.Env = os.Environ()
+
+	// Pass the listeners' file descriptors to the child process
+	if isFromOverseer() && len(listeners) > 0 {
+		// Get the file descriptor for each listener
+		cmd.ExtraFiles = make([]*os.File, 0, len(listeners))
+		for _, ln := range listeners {
+			if l, ok := ln.(*net.TCPListener); ok {
+				file, err := l.File()
+				if err != nil {
+					return fmt.Errorf("failed to get TCP listener file descriptor: %v", err)
+				}
+				cmd.ExtraFiles = append(cmd.ExtraFiles, file)
+			}
+		}
+	}
+
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// Start the subprocess
+	if err = cmd.Start(); err != nil {
+		return fmt.Errorf("failed to create child process: %v", err)
+	}
+
+	cfg.ErrorHandler("parent", fmt.Errorf("child process started, PID: %d, %d listeners passed", cmd.Process.Pid, len(cmd.ExtraFiles)))
+	return nil
 }

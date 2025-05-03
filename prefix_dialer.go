@@ -26,7 +26,7 @@ func (pd PrefixDialer) Dial(name string) (net.Conn, error) {
 
 	c, err := dial(builder.String())
 
-	// attempt to remove file if nobofy is listening
+	// attempt to remove the file if nobody is listening
 	if err != nil && errorIsNobodyListening(err) {
 		_ = os.Remove(builder.String())
 		// re-dial to have a nice fs.ErrNotExist error

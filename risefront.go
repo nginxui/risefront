@@ -67,6 +67,23 @@ func New(ctx context.Context, cfg Config) (err error) {
 	if err != nil {
 		return fmt.Errorf("failed to get executable path: %v", err)
 	}
+
+	// Set default values before saving the global configuration
+	if cfg.Network == "" {
+		cfg.Network = "tcp"
+	}
+	if cfg.ErrorHandler == nil {
+		cfg.ErrorHandler = func(kind string, err error) {
+			log.Println(kind, err)
+		}
+	}
+	if cfg.RestartSignal == nil {
+		cfg.RestartSignal = SIGUSR1
+	}
+	if cfg.Dialer == nil {
+		cfg.Dialer = PrefixDialer{}
+	}
+
 	// Save the global configuration for use in Restart
 	globalConfig = cfg
 
@@ -74,8 +91,13 @@ func New(ctx context.Context, cfg Config) (err error) {
 	if listeners, err := FromOverseerFDs(); err != nil {
 		return err
 	} else if len(listeners) > 0 {
-		// Listen for signals and pass the listeners to the child process
+		// Store the listeners globally for restart functionality
 		globalListeners = listeners
+
+		// Log successful migration from overseer
+		cfg.ErrorHandler("overseer", fmt.Errorf("successfully migrated from overseer with %d listeners", len(listeners)))
+
+		// Listen for signals and pass the listeners to the child process
 		WatchOverseerSignal(cfg.RestartSignal, listeners)
 
 		// Create a goroutine to listen for context cancellation
@@ -91,21 +113,6 @@ func New(ctx context.Context, cfg Config) (err error) {
 		case err := <-runCh:
 			return err
 		}
-	}
-
-	if cfg.Dialer == nil {
-		cfg.Dialer = PrefixDialer{}
-	}
-	if cfg.Network == "" {
-		cfg.Network = "tcp"
-	}
-	if cfg.ErrorHandler == nil {
-		cfg.ErrorHandler = func(kind string, err error) {
-			log.Println(kind, err)
-		}
-	}
-	if cfg.RestartSignal == nil {
-		cfg.RestartSignal = SIGUSR1
 	}
 
 	var builder strings.Builder
@@ -550,9 +557,18 @@ func Restart() {
 		return
 	}
 
+	log.Printf("Starting restart with %d listeners", len(globalListeners))
+
+	// 将信息打印到标准输出，以便更好地诊断问题
+	for i, ln := range globalListeners {
+		log.Printf("Listener %d: %T at %s", i, ln, ln.Addr().String())
+	}
+
 	err := globalConfig.createChild(globalListeners)
 	if err != nil {
 		log.Printf("Restart failed: %v", err)
+	} else {
+		log.Println("Restart successful, new child process created")
 	}
 }
 
@@ -565,17 +581,43 @@ func (cfg Config) createChild(listeners []net.Listener) (err error) {
 	cmd.Env = os.Environ()
 
 	// Pass the listeners' file descriptors to the child process
-	if isFromOverseer() && len(listeners) > 0 {
+	var filesToClose []*os.File
+	if len(listeners) > 0 {
+		// Set the OVERSEER_NUM_FDS environment variable for compatibility
+		cmd.Env = append(cmd.Env, fmt.Sprintf("OVERSEER_NUM_FDS=%d", len(listeners)))
+
 		// Get the file descriptor for each listener
 		cmd.ExtraFiles = make([]*os.File, 0, len(listeners))
 		for _, ln := range listeners {
+			var file *os.File
+			var err error
+
+			// Handle different listener types
 			if l, ok := ln.(*net.TCPListener); ok {
-				file, err := l.File()
-				if err != nil {
-					return fmt.Errorf("failed to get TCP listener file descriptor: %v", err)
+				file, err = l.File()
+			} else if l, ok := ln.(*net.UnixListener); ok {
+				file, err = l.File()
+			} else {
+				// Try a generic approach for other listener types
+				fileConn, ok := ln.(interface{ File() (*os.File, error) })
+				if ok {
+					file, err = fileConn.File()
+				} else {
+					cfg.ErrorHandler("createChild", fmt.Errorf("unsupported listener type: %T", ln))
+					continue
 				}
-				cmd.ExtraFiles = append(cmd.ExtraFiles, file)
 			}
+
+			if err != nil {
+				// Close any files we've opened so far
+				for _, f := range filesToClose {
+					f.Close()
+				}
+				return fmt.Errorf("failed to get listener file descriptor: %v", err)
+			}
+
+			cmd.ExtraFiles = append(cmd.ExtraFiles, file)
+			filesToClose = append(filesToClose, file)
 		}
 	}
 
@@ -585,9 +627,20 @@ func (cfg Config) createChild(listeners []net.Listener) (err error) {
 
 	// Start the subprocess
 	if err = cmd.Start(); err != nil {
+		// Close all the files we've opened
+		for _, f := range filesToClose {
+			f.Close()
+		}
 		return fmt.Errorf("failed to create child process: %v", err)
 	}
 
-	cfg.ErrorHandler("parent", fmt.Errorf("child process started, PID: %d, %d listeners passed", cmd.Process.Pid, len(cmd.ExtraFiles)))
+	// Log the successful child process start
+	log.Printf("Child process started, PID: %d, %d listeners passed", cmd.Process.Pid, len(cmd.ExtraFiles))
+
+	// Now that the child process has started, we can safely close our copies of the file descriptors
+	for _, f := range filesToClose {
+		f.Close()
+	}
+
 	return nil
 }

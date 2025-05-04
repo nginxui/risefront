@@ -67,10 +67,19 @@ func FromOverseerFDs() ([]net.Listener, error) {
 			continue
 		}
 
+		// Create a listener from the file descriptor
 		l, err := net.FileListener(f)
+
+		// Always close the file after creating the listener
+		// This won't affect the listener, as FileListener duplicates the descriptor
+		if f != nil {
+			f.Close()
+		}
+
 		if err != nil {
 			return nil, fmt.Errorf("failed to take over overseer file descriptor: %w", err)
 		}
+
 		listeners = append(listeners, l)
 	}
 
@@ -108,28 +117,44 @@ func WatchOverseerSignal(sig os.Signal, listeners []net.Listener) {
 			cmd.Env = os.Environ()
 
 			// Pass the listeners' file descriptors to the child process
+			var filesToClose []*os.File
 			if len(listeners) > 0 {
 				// Set the OVERSEER_NUM_FDS environment variable
 				cmd.Env = append(cmd.Env, fmt.Sprintf("OVERSEER_NUM_FDS=%d", len(listeners)))
 
 				// Get the file descriptor for each listener
 				cmd.ExtraFiles = make([]*os.File, 0, len(listeners))
-				for _, ln := range listeners {
+				for i, ln := range listeners {
+					var file *os.File
+					var err error
+
+					// Handle different listener types
 					if tcpLn, ok := ln.(*net.TCPListener); ok {
-						file, err := tcpLn.File()
-						if err != nil {
-							log.Printf("Failed to get TCP listener file descriptor: %v", err)
-							continue
-						}
-						cmd.ExtraFiles = append(cmd.ExtraFiles, file)
+						file, err = tcpLn.File()
 					} else if unixLn, ok := ln.(*net.UnixListener); ok {
-						file, err := unixLn.File()
-						if err != nil {
-							log.Printf("Failed to get Unix listener file descriptor: %v", err)
+						file, err = unixLn.File()
+					} else {
+						// Try a generic approach for other listener types
+						fileConn, ok := ln.(interface{ File() (*os.File, error) })
+						if ok {
+							file, err = fileConn.File()
+						} else {
+							log.Printf("Unsupported listener type at index %d: %T", i, ln)
 							continue
 						}
-						cmd.ExtraFiles = append(cmd.ExtraFiles, file)
 					}
+
+					if err != nil {
+						// Close any files we've opened so far
+						for _, f := range filesToClose {
+							f.Close()
+						}
+						log.Printf("Failed to get listener file descriptor: %v", err)
+						continue
+					}
+
+					cmd.ExtraFiles = append(cmd.ExtraFiles, file)
+					filesToClose = append(filesToClose, file)
 				}
 			}
 
@@ -140,8 +165,17 @@ func WatchOverseerSignal(sig os.Signal, listeners []net.Listener) {
 
 			// Start the child process
 			if err := cmd.Start(); err != nil {
+				// Close all the files we've opened
+				for _, f := range filesToClose {
+					f.Close()
+				}
 				log.Printf("Failed to create child process: %v", err)
 				continue
+			}
+
+			// Now that the child process has started, we can safely close our copies of the file descriptors
+			for _, f := range filesToClose {
+				f.Close()
 			}
 
 			log.Printf("Child process started, PID: %d, passed %d listeners", cmd.Process.Pid, len(cmd.ExtraFiles))

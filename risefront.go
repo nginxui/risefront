@@ -45,7 +45,8 @@ type Config struct {
 	RestartSignal os.Signal                    // Signal to trigger a restart
 	NoRestart     bool                         // Disables all restarts
 
-	_ struct{} // to later add fields without break compatibility.
+	_          struct{} // to later add fields without break compatibility.
+	executable string
 }
 
 // New calls cfg.Run with opened listeners.
@@ -56,7 +57,11 @@ type Config struct {
 //
 // The parent will live as long as the context lives.
 // The child will live as long as the parent is alive and no other child has been started.
-func New(ctx context.Context, cfg Config) error {
+func New(ctx context.Context, cfg Config) (err error) {
+	cfg.executable, err = os.Executable()
+	if err != nil {
+		return fmt.Errorf("failed to get executable path: %v", err)
+	}
 	// Save the global configuration for use in Restart
 	globalConfig = cfg
 
@@ -460,15 +465,9 @@ func Restart() {
 }
 
 // createChild creates a child process with the specified listeners
-func (cfg Config) createChild(listeners []net.Listener) error {
-	// Get the executable file path of the current program
-	executable, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("failed to get executable path: %v", err)
-	}
-
+func (cfg Config) createChild(listeners []net.Listener) (err error) {
 	// Create the child process
-	cmd := exec.Command(executable)
+	cmd := exec.Command(cfg.executable)
 
 	// Inherit the current process's environment variables
 	cmd.Env = os.Environ()

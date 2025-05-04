@@ -24,7 +24,7 @@ import (
 
 // Storing global configurations for use in Restart functions
 var (
-	globalConfig    Config
+	globalConfig Config
 )
 
 // Dialer is used for the child-parent communication.
@@ -46,7 +46,7 @@ type Config struct {
 
 	_ struct{} // to later add fields without break compatibility.
 
-	executable string // path to the executable
+	args []string // Arguments passed to the child process
 }
 
 // New calls cfg.Run with opened listeners.
@@ -58,12 +58,8 @@ type Config struct {
 // The parent will live as long as the context lives.
 // The child will live as long as the parent is alive and no other child has been started.
 func New(ctx context.Context, cfg Config) error {
-	// Get the executable file path of the current program
-	executable, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	cfg.executable = executable
+	// Save the original arguments to pass to the child process
+	cfg.args = os.Args
 
 	// Save the global configuration for use in Restart
 	globalConfig = cfg
@@ -460,10 +456,17 @@ func Restart() {
 // createChild creates a child process
 func (cfg Config) createChild() error {
 	// Create the child process
-	cmd := exec.Command(cfg.executable)
+	cmd := exec.Command(cfg.args[0], cfg.args[1:]...)
 
 	// Inherit the current process's environment variables
 	cmd.Env = os.Environ()
+
+	// Set the working directory to the current process's working directory
+	wd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	cmd.Dir = wd
 
 	// Pass the listeners' file descriptors to the child process
 	if isFromOverseer() {
@@ -490,7 +493,7 @@ func (cfg Config) createChild() error {
 	cmd.Stderr = os.Stderr
 
 	// Start the subprocess
-	if err := cmd.Start(); err != nil {
+	if err = cmd.Start(); err != nil {
 		return err
 	}
 

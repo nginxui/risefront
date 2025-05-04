@@ -22,7 +22,10 @@ func init() {
 }
 
 func listen(name string) (net.Listener, error) {
-	return net.Listen("unix", path.Join(workingDirectory, name))
+	fullPath := path.Join(workingDirectory, name)
+	// Try to remove the socket file if it exists (it might be a stale one from a previous run)
+	_ = os.Remove(fullPath)
+	return net.Listen("unix", fullPath)
 }
 
 func dial(name string) (net.Conn, error) {

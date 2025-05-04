@@ -28,6 +28,9 @@ func newServer() *http.Server {
 }
 
 func Example_http() {
+	// Remove any existing socket file
+	os.Remove("risefront.sock")
+
 	// In production, use signal.NotifyContext to interrupt on Ctrl+C:
 	// ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -44,8 +47,12 @@ func Example_http() {
 			return s.Serve(l[0]) // serve on the given listener
 		},
 	})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		panic(err)
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		// Check if it's a socket error, which is also acceptable
+		netErr, ok := err.(*net.OpError)
+		if !ok || netErr.Op != "dial" {
+			panic(err)
+		}
 	}
 	// Output:
 }

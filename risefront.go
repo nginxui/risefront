@@ -58,6 +58,11 @@ type Config struct {
 // The parent will live as long as the context lives.
 // The child will live as long as the parent is alive and no other child has been started.
 func New(ctx context.Context, cfg Config) (err error) {
+	// Check for immediate context cancellation
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
 	cfg.executable, err = os.Executable()
 	if err != nil {
 		return fmt.Errorf("failed to get executable path: %v", err)
@@ -72,7 +77,20 @@ func New(ctx context.Context, cfg Config) (err error) {
 		// Listen for signals and pass the listeners to the child process
 		globalListeners = listeners
 		WatchOverseerSignal(cfg.RestartSignal, listeners)
-		return cfg.Run(listeners)
+
+		// Create a goroutine to listen for context cancellation
+		runCh := make(chan error, 1)
+		go func() {
+			runCh <- cfg.Run(listeners)
+		}()
+
+		// Wait for either context cancellation or Run to complete
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-runCh:
+			return err
+		}
 	}
 
 	if cfg.Dialer == nil {
@@ -103,7 +121,20 @@ func New(ctx context.Context, cfg Config) (err error) {
 		if !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
-		return cfg.runParent(ctx, builder.String())
+
+		// Create a channel for the runParent error
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- cfg.runParent(ctx, builder.String())
+		}()
+
+		// Wait for either context cancellation or runParent to complete
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-errCh:
+			return err
+		}
 	}
 
 	return cfg.runChild(c)
@@ -140,10 +171,15 @@ func (cfg Config) runParent(ctx context.Context, socket string) error {
 	if err != nil {
 		return err
 	}
+
+	// Create a channel to notify when the context is done
+	ctxDoneCh := make(chan struct{})
 	go func() {
 		<-ctx.Done()
+		close(ctxDoneCh)
 		_ = lnChild.Close()
 	}()
+
 	defer func(lnChild net.Listener) {
 		_ = lnChild.Close()
 	}(lnChild)
@@ -157,7 +193,7 @@ func (cfg Config) runParent(ctx context.Context, socket string) error {
 	forwarderChs := make([]chan *forwarder, 0, len(cfg.Addresses))
 	listeners := make([]net.Listener, 0, len(cfg.Addresses))
 
-	// Save the global listeners for use in Restart
+	// Save the global listeners for use in Restart (initial empty slice)
 	globalListeners = listeners
 
 	closeListeners := func() {
@@ -168,6 +204,8 @@ func (cfg Config) runParent(ctx context.Context, socket string) error {
 			}
 		}
 	}
+	// Make sure we close the listeners when returning
+	defer closeListeners()
 
 	// Set up the restart signal processor
 	if !cfg.NoRestart {
@@ -185,10 +223,17 @@ func (cfg Config) runParent(ctx context.Context, socket string) error {
 		}()
 	}
 
+	// Set up listeners
 	for _, a := range cfg.Addresses {
+		// Check for context cancellation
+		select {
+		case <-ctxDoneCh:
+			return ctx.Err()
+		default:
+		}
+
 		ln, err := net.Listen(cfg.Network, a)
 		if err != nil {
-			closeListeners()
 			return err
 		}
 		listeners = append(listeners, ln)
@@ -212,8 +257,10 @@ func (cfg Config) runParent(ctx context.Context, socket string) error {
 		go cfg.runInternalListener(connCh, forwarderCh, &sl, wgInternalListeners.Done)
 	}
 
-	defer closeListeners()
+	// Update global listeners after they've been populated
+	globalListeners = listeners
 
+	// Immediately close the parentReady channel (in tests)
 	// All set, run first child
 	go func() {
 		err := cfg.Run(firstChildListeners)
@@ -224,18 +271,45 @@ func (cfg Config) runParent(ctx context.Context, socket string) error {
 
 	// listen for new children
 	for {
+		// Check for context cancellation
+		select {
+		case <-ctxDoneCh:
+			return ctx.Err()
+		default:
+		}
+
+		// Use Accept with a short timeout to allow for context cancellation checks
+		if dl, ok := lnChild.(interface{ SetDeadline(time.Time) error }); ok {
+			_ = dl.SetDeadline(time.Now().Add(100 * time.Millisecond))
+		}
+
 		rw, err := lnChild.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			cfg.ErrorHandler("parent.sock.Accept", err)
+
 			var ne net.Error
 			if errors.As(err, &ne) && ne.Timeout() {
-				time.Sleep(5 * time.Millisecond)
+				// Just a timeout - continue and check context again
 				continue
 			}
+
+			// Only log if it's not a closed connection error (which happens during shutdown)
+			if !errors.Is(err, net.ErrClosed) {
+				cfg.ErrorHandler("parent.sock.Accept", err)
+			}
+
+			// If it's a real error (not a timeout), return
 			return err
+		}
+
+		// Check if the context was canceled while waiting for the Accept call
+		select {
+		case <-ctxDoneCh:
+			_ = rw.Close()
+			return ctx.Err()
+		default:
 		}
 
 		newForwarders, err := cfg.handleChildRequest(rw)
@@ -421,21 +495,39 @@ func (cfg Config) runChild(rw io.ReadWriteCloser) error {
 		return err
 	}
 
+	// Context cancellation detector
+	ctxCancel := make(chan struct{})
+	ctxDone := make(chan error, 1)
+
 	go func() {
 		b := make([]byte, 1)
 		for {
 			_, err := rw.Read(b)
 			if err != nil {
+				select {
+				case <-ctxCancel:
+					// Context was already canceled
+				default:
+					closeListeners()
+				}
 				break
 			}
 		}
-		closeListeners()
 	}()
 
-	if err := cfg.Run(listeners); !errors.Is(err, net.ErrClosed) {
+	runErr := cfg.Run(listeners)
+	close(ctxCancel)
+
+	// Check if we should return context.Canceled from ctxDone
+	select {
+	case err := <-ctxDone:
 		return err
+	default:
+		if !errors.Is(runErr, net.ErrClosed) {
+			return runErr
+		}
+		return nil
 	}
-	return nil
 }
 
 func randomPrefix(n int) (string, error) {

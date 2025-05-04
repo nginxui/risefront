@@ -68,9 +68,13 @@ func FromOverseerFDs() ([]net.Listener, error) {
 		}
 
 		l, err := net.FileListener(f)
+		// Close the file now that we have created the listener
+		f.Close()
+
 		if err != nil {
 			return nil, fmt.Errorf("failed to take over overseer file descriptor: %w", err)
 		}
+
 		listeners = append(listeners, l)
 	}
 
@@ -114,22 +118,35 @@ func WatchOverseerSignal(sig os.Signal, listeners []net.Listener) {
 
 				// Get the file descriptor for each listener
 				cmd.ExtraFiles = make([]*os.File, 0, len(listeners))
-				for _, ln := range listeners {
+				for i, ln := range listeners {
+					var file *os.File
+					var err error
+
+					// Handle different listener types
 					if tcpLn, ok := ln.(*net.TCPListener); ok {
-						file, err := tcpLn.File()
-						if err != nil {
-							log.Printf("Failed to get TCP listener file descriptor: %v", err)
-							continue
-						}
-						cmd.ExtraFiles = append(cmd.ExtraFiles, file)
+						file, err = tcpLn.File()
 					} else if unixLn, ok := ln.(*net.UnixListener); ok {
-						file, err := unixLn.File()
-						if err != nil {
-							log.Printf("Failed to get Unix listener file descriptor: %v", err)
+						file, err = unixLn.File()
+					} else {
+						// Try a generic approach for other listener types
+						fileConn, ok := ln.(interface{ File() (*os.File, error) })
+						if ok {
+							file, err = fileConn.File()
+						} else {
+							log.Printf("Unsupported listener type at index %d: %T", i, ln)
 							continue
 						}
-						cmd.ExtraFiles = append(cmd.ExtraFiles, file)
 					}
+
+					if err != nil {
+						log.Printf("Failed to get listener file descriptor: %v", err)
+						continue
+					}
+
+					cmd.ExtraFiles = append(cmd.ExtraFiles, file)
+					// The file will be closed when the cmd.ExtraFiles files are closed,
+					// but to avoid leaking FDs in the current process, we should close our copy
+					defer file.Close()
 				}
 			}
 

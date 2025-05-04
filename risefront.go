@@ -565,17 +565,40 @@ func (cfg Config) createChild(listeners []net.Listener) (err error) {
 	cmd.Env = os.Environ()
 
 	// Pass the listeners' file descriptors to the child process
-	if isFromOverseer() && len(listeners) > 0 {
+	if len(listeners) > 0 {
+		// Set the OVERSEER_NUM_FDS environment variable for compatibility
+		cmd.Env = append(cmd.Env, fmt.Sprintf("OVERSEER_NUM_FDS=%d", len(listeners)))
+
 		// Get the file descriptor for each listener
 		cmd.ExtraFiles = make([]*os.File, 0, len(listeners))
 		for _, ln := range listeners {
+			var file *os.File
+			var err error
+
+			// Handle different listener types
 			if l, ok := ln.(*net.TCPListener); ok {
-				file, err := l.File()
-				if err != nil {
-					return fmt.Errorf("failed to get TCP listener file descriptor: %v", err)
+				file, err = l.File()
+			} else if l, ok := ln.(*net.UnixListener); ok {
+				file, err = l.File()
+			} else {
+				// Try a generic approach for other listener types
+				fileConn, ok := ln.(interface{ File() (*os.File, error) })
+				if ok {
+					file, err = fileConn.File()
+				} else {
+					cfg.ErrorHandler("createChild", fmt.Errorf("unsupported listener type: %T", ln))
+					continue
 				}
-				cmd.ExtraFiles = append(cmd.ExtraFiles, file)
 			}
+
+			if err != nil {
+				return fmt.Errorf("failed to get listener file descriptor: %v", err)
+			}
+
+			cmd.ExtraFiles = append(cmd.ExtraFiles, file)
+			// The file will be closed when the cmd.ExtraFiles files are closed,
+			// but to avoid leaking FDs in the current process, we should close our copy
+			defer file.Close()
 		}
 	}
 

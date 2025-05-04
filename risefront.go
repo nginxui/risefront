@@ -22,10 +22,9 @@ import (
 	"time"
 )
 
-// 存储全局配置和监听器，用于Restart函数
+// Storing global configurations for use in Restart functions
 var (
 	globalConfig    Config
-	globalListeners []net.Listener
 )
 
 // Dialer is used for the child-parent communication.
@@ -46,6 +45,8 @@ type Config struct {
 	NoRestart     bool                         // Disables all restarts
 
 	_ struct{} // to later add fields without break compatibility.
+
+	executable string // path to the executable
 }
 
 // New calls cfg.Run with opened listeners.
@@ -57,6 +58,13 @@ type Config struct {
 // The parent will live as long as the context lives.
 // The child will live as long as the parent is alive and no other child has been started.
 func New(ctx context.Context, cfg Config) error {
+	// Get the executable file path of the current program
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	cfg.executable = executable
+
 	// Save the global configuration for use in Restart
 	globalConfig = cfg
 
@@ -64,8 +72,6 @@ func New(ctx context.Context, cfg Config) error {
 	if listeners, err := FromOverseerFDs(); err != nil {
 		return err
 	} else if len(listeners) > 0 {
-		// Listen for signals and pass the listeners to the child process
-		globalListeners = listeners
 		WatchOverseerSignal(cfg.RestartSignal, listeners)
 		return cfg.Run(listeners)
 	}
@@ -152,9 +158,6 @@ func (cfg Config) runParent(ctx context.Context, socket string) error {
 	forwarderChs := make([]chan *forwarder, 0, len(cfg.Addresses))
 	listeners := make([]net.Listener, 0, len(cfg.Addresses))
 
-	// Save the global listeners for use in Restart
-	globalListeners = listeners
-
 	closeListeners := func() {
 		for _, ln := range listeners {
 			err := ln.Close()
@@ -171,7 +174,7 @@ func (cfg Config) runParent(ctx context.Context, socket string) error {
 		go func() {
 			for range restartCh {
 				cfg.ErrorHandler("parent", errors.New("restart signal received, starting new child process"))
-				err := cfg.createChild(listeners)
+				err := cfg.createChild()
 				if err != nil {
 					cfg.ErrorHandler("parent.createChild", err)
 					continue
@@ -448,40 +451,34 @@ type childRequest struct {
 
 // Restart creates a child process instead of sending a signal
 func Restart() {
-	if len(globalListeners) == 0 {
-		log.Println("Unable to restart: no valid listeners found")
-		return
-	}
-
-	err := globalConfig.createChild(globalListeners)
+	err := globalConfig.createChild()
 	if err != nil {
-		log.Printf("Restart failed: %v", err)
+		globalConfig.ErrorHandler("restart.createChild", fmt.Errorf("restart failed: %v", err))
 	}
 }
 
-// createChild creates a child process with the specified listeners
-func (cfg Config) createChild(listeners []net.Listener) error {
-	// Get the executable file path of the current program
-	executable, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("failed to get executable path: %v", err)
-	}
-
+// createChild creates a child process
+func (cfg Config) createChild() error {
 	// Create the child process
-	cmd := exec.Command(executable)
+	cmd := exec.Command(cfg.executable)
 
 	// Inherit the current process's environment variables
 	cmd.Env = os.Environ()
 
 	// Pass the listeners' file descriptors to the child process
-	if isFromOverseer() && len(listeners) > 0 {
+	if isFromOverseer() {
+		listeners, err := FromOverseerFDs()
+		if err != nil {
+			return err
+		}
+
 		// Get the file descriptor for each listener
 		cmd.ExtraFiles = make([]*os.File, 0, len(listeners))
 		for _, ln := range listeners {
 			if l, ok := ln.(*net.TCPListener); ok {
 				file, err := l.File()
 				if err != nil {
-					return fmt.Errorf("failed to get TCP listener file descriptor: %v", err)
+					return err
 				}
 				cmd.ExtraFiles = append(cmd.ExtraFiles, file)
 			}
@@ -493,8 +490,8 @@ func (cfg Config) createChild(listeners []net.Listener) error {
 	cmd.Stderr = os.Stderr
 
 	// Start the subprocess
-	if err = cmd.Start(); err != nil {
-		return fmt.Errorf("failed to create child process: %v", err)
+	if err := cmd.Start(); err != nil {
+		return err
 	}
 
 	cfg.ErrorHandler("parent", fmt.Errorf("child process started, PID: %d, %d listeners passed", cmd.Process.Pid, len(cmd.ExtraFiles)))

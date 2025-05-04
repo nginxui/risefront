@@ -15,7 +15,7 @@ var workingDirectory string
 
 func init() {
 	workingDirectory, _ = os.Getwd()
-	if unix.Access(dir, unix.W_OK) != nil {
+	if unix.Access(workingDirectory, unix.W_OK) != nil {
 		log.Println("The current working directory is not writable, using temp dir")
 		workingDirectory = os.TempDir()
 	}

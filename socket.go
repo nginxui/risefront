@@ -11,20 +11,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-var workingDirectory string
-
-func init() {
-	workingDirectory, _ = os.Getwd()
-	if unix.Access(workingDirectory, unix.W_OK) != nil {
-		log.Println("The current working directory is not writable, using temp dir")
-		workingDirectory = os.TempDir()
-	}
-}
+var socketDirectory = os.TempDir()
 
 func listen(name string) (net.Listener, error) {
-	return net.Listen("unix", path.Join(workingDirectory, name))
+	return net.Listen("unix", path.Join(socketDirectory, name))
 }
 
 func dial(name string) (net.Conn, error) {
-	return net.Dial("unix", path.Join(workingDirectory, name))
+	return net.Dial("unix", path.Join(socketDirectory, name))
 }

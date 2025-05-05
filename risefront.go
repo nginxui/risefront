@@ -73,7 +73,7 @@ func New(ctx context.Context, cfg Config) error {
 	}
 
 	if cfg.Dialer == nil {
-		cfg.Dialer = PrefixDialer{}
+		cfg.Dialer = cfg.NewPrefixDialer("")
 	}
 	if cfg.Network == "" {
 		cfg.Network = "tcp"

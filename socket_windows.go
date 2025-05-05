@@ -15,3 +15,8 @@ func listen(name string) (net.Listener, error) {
 func dial(name string) (net.Conn, error) {
 	return winio.DialPipe(`\\.\pipe\`+name, nil)
 }
+
+func getWorkingDir() string {
+	// Windows does not need it for named pipes
+	return ""
+}

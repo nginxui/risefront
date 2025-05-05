@@ -37,12 +37,13 @@ type Config struct {
 	Addresses []string                   // Addresses to listen to.
 	Run       func([]net.Listener) error // Handle the connections. All open connections should be properly closed before returning (srv.Shutdown for http.Server for instance).
 
-	Name          string                       // Name of the socket file
-	Dialer        Dialer                       // Dialer for child-parent communication. Let empty for default dialer (PrefixDialer{}).
-	Network       string                       // "tcp" (default if empty), "tcp4", "tcp6", "unix" or "unixpacket"
-	ErrorHandler  func(kind string, err error) // Where errors should be logged (print to stderr by default)
-	RestartSignal os.Signal                    // Signal to trigger a restart
-	NoRestart     bool                         // Disables all restarts
+	Name          string                                           // Name of the socket file
+	Dialer        Dialer                                           // Dialer for child-parent communication. Let empty for default dialer (PrefixDialer{}).
+	Network       string                                           // "tcp" (default if empty), "tcp4", "tcp6", "unix" or "unixpacket"
+	ErrorHandler  func(kind string, err error)                     // Where errors should be logged (print to stderr by default)
+	RestartSignal os.Signal                                        // Signal to trigger a restart
+	NoRestart     bool                                             // Disables all restarts
+	LogHandler    func(loglevel LogLevel, kind string, args ...interface{}) // Where debug messages should be logged
 
 	_ struct{} // to later add fields without break compatibility.
 
@@ -81,6 +82,15 @@ func New(ctx context.Context, cfg Config) error {
 	if cfg.ErrorHandler == nil {
 		cfg.ErrorHandler = func(kind string, err error) {
 			log.Println(kind, err)
+		}
+	}
+	if cfg.LogHandler == nil {
+		cfg.LogHandler = func(loglevel LogLevel, kind string, args ...interface{}) {
+			if loglevel >= ErrorLevel {
+				cfg.ErrorHandler(kind, fmt.Errorf("%v", args))
+				return
+			}
+			log.Println(kind, args)
 		}
 	}
 	if cfg.RestartSignal == nil {
@@ -158,7 +168,7 @@ func (cfg Config) runParent(ctx context.Context, socket string) error {
 		for _, ln := range listeners {
 			err := ln.Close()
 			if err != nil && !errors.Is(err, net.ErrClosed) {
-				cfg.ErrorHandler("parent.sock.Close", err)
+				cfg.LogHandler(ErrorLevel, "parent.sock.Close", err)
 			}
 		}
 	}
@@ -169,10 +179,10 @@ func (cfg Config) runParent(ctx context.Context, socket string) error {
 		signal.Notify(restartCh, cfg.RestartSignal)
 		go func() {
 			for range restartCh {
-				cfg.ErrorHandler("parent", errors.New("restart signal received, starting new child process"))
+				cfg.LogHandler(InfoLevel, "parent", "restart signal received, starting new child process")
 				err := cfg.createChild()
 				if err != nil {
-					cfg.ErrorHandler("parent.createChild", err)
+					cfg.LogHandler(ErrorLevel, "parent.createChild", err)
 					continue
 				}
 			}
@@ -212,7 +222,7 @@ func (cfg Config) runParent(ctx context.Context, socket string) error {
 	go func() {
 		err := cfg.Run(firstChildListeners)
 		if err != nil {
-			cfg.ErrorHandler("parent.Run", err)
+			cfg.LogHandler(ErrorLevel, "parent.Run", err)
 		}
 	}()
 
@@ -223,7 +233,7 @@ func (cfg Config) runParent(ctx context.Context, socket string) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			cfg.ErrorHandler("parent.sock.Accept", err)
+			cfg.LogHandler(ErrorLevel, "parent.sock.Accept", err)
 			var ne net.Error
 			if errors.As(err, &ne) && ne.Timeout() {
 				time.Sleep(5 * time.Millisecond)
@@ -234,7 +244,7 @@ func (cfg Config) runParent(ctx context.Context, socket string) error {
 
 		newForwarders, err := cfg.handleChildRequest(rw)
 		if err != nil {
-			cfg.ErrorHandler("child.Request", err)
+			cfg.LogHandler(WarnLevel, "child.Request", err)
 			continue
 		}
 
@@ -250,7 +260,7 @@ func (cfg Config) runExternalListener(ln net.Listener, ch chan net.Conn) {
 		rw, err := ln.Accept()
 
 		if err != nil {
-			cfg.ErrorHandler("parent."+ln.Addr().String()+".Accept", err)
+			cfg.LogHandler(WarnLevel, "parent."+ln.Addr().String()+".Accept", err)
 			var ne net.Error
 			if errors.As(err, &ne) && ne.Timeout() {
 				time.Sleep(5 * time.Millisecond)
@@ -326,7 +336,7 @@ func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarder, error
 					wgClose.Done()
 					if err != nil {
 						_ = cliConn.Close()
-						cfg.ErrorHandler("child."+addr+".Dial", err)
+						cfg.LogHandler(ErrorLevel, "child."+addr+".Dial", err)
 						return
 					}
 					proxy(srvConn, cliConn)
@@ -374,7 +384,7 @@ func (cfg Config) runChild(rw io.ReadWriteCloser) error {
 		for _, ln := range listeners {
 			err := ln.Close()
 			if err != nil && !errors.Is(err, net.ErrClosed) {
-				cfg.ErrorHandler("child.sock.Close", err)
+				cfg.LogHandler(WarnLevel, "child.sock.Close", err)
 			}
 		}
 	}
@@ -449,7 +459,7 @@ type childRequest struct {
 func Restart() {
 	err := globalConfig.createChild()
 	if err != nil {
-		globalConfig.ErrorHandler("restart.createChild", fmt.Errorf("restart failed: %v", err))
+		globalConfig.LogHandler(ErrorLevel, "restart.createChild", err)
 	}
 }
 
@@ -497,6 +507,6 @@ func (cfg Config) createChild() error {
 		return err
 	}
 
-	cfg.ErrorHandler("parent", fmt.Errorf("child process started, PID: %d, %d listeners passed", cmd.Process.Pid, len(cmd.ExtraFiles)))
+	cfg.LogHandler(DebugLevel, "parent", fmt.Errorf("child process started, PID: %d, %d listeners passed", cmd.Process.Pid, len(cmd.ExtraFiles)))
 	return nil
 }

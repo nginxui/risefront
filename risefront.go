@@ -169,7 +169,6 @@ func (cfg Config) runParent(ctx context.Context, socket string) error {
 		signal.Notify(restartCh, cfg.RestartSignal)
 		go func() {
 			for range restartCh {
-				cfg.ErrorHandler("parent", errors.New("restart signal received, starting new child process"))
 				err := cfg.createChild()
 				if err != nil {
 					cfg.ErrorHandler("parent.createChild", err)
@@ -354,7 +353,6 @@ func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarder, error
 		_ = rw.Close()
 	}()
 
-	fmt.Println(req.Addresses)
 	return forwarders, nil
 }
 
@@ -496,7 +494,5 @@ func (cfg Config) createChild() error {
 	if err = cmd.Start(); err != nil {
 		return err
 	}
-
-	cfg.ErrorHandler("parent", fmt.Errorf("child process started, PID: %d, %d listeners passed", cmd.Process.Pid, len(cmd.ExtraFiles)))
 	return nil
 }

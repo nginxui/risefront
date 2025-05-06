@@ -24,7 +24,7 @@ import (
 
 // Storing global configurations for use in Restart functions
 var (
-	globalConfig Config
+	globalConfig *Config
 )
 
 // Dialer is used for the child-parent communication.
@@ -37,12 +37,12 @@ type Config struct {
 	Addresses []string                   // Addresses to listen to.
 	Run       func([]net.Listener) error // Handle the connections. All open connections should be properly closed before returning (srv.Shutdown for http.Server for instance).
 
-	Name          string                                           // Name of the socket file
-	Dialer        Dialer                                           // Dialer for child-parent communication. Let empty for default dialer (PrefixDialer{}).
-	Network       string                                           // "tcp" (default if empty), "tcp4", "tcp6", "unix" or "unixpacket"
-	ErrorHandler  func(kind string, err error)                     // Where errors should be logged (print to stderr by default)
-	RestartSignal os.Signal                                        // Signal to trigger a restart
-	NoRestart     bool                                             // Disables all restarts
+	Name          string                                                    // Name of the socket file
+	Dialer        Dialer                                                    // Dialer for child-parent communication. Let empty for default dialer (PrefixDialer{}).
+	Network       string                                                    // "tcp" (default if empty), "tcp4", "tcp6", "unix" or "unixpacket"
+	ErrorHandler  func(kind string, err error)                              // Where errors should be logged (print to stderr by default)
+	RestartSignal os.Signal                                                 // Signal to trigger a restart
+	NoRestart     bool                                                      // Disables all restarts
 	LogHandler    func(loglevel LogLevel, kind string, args ...interface{}) // Where debug messages should be logged
 
 	_ struct{} // to later add fields without break compatibility.
@@ -59,11 +59,11 @@ type Config struct {
 // The parent will live as long as the context lives.
 // The child will live as long as the parent is alive and no other child has been started.
 func New(ctx context.Context, cfg Config) error {
+	// Save the global configuration for use in Restart
+	globalConfig = &cfg
+
 	// Save the original arguments to pass to the child process
 	cfg.args = os.Args
-
-	// Save the global configuration for use in Restart
-	globalConfig = cfg
 
 	// First, try to get file descriptors from overseer
 	if listeners, err := FromOverseerFDs(); err != nil {
@@ -457,6 +457,10 @@ type childRequest struct {
 
 // Restart creates a child process instead of sending a signal
 func Restart() {
+	if globalConfig == nil {
+		panic("globalConfig is nil, Restart() should only be called from within a child process")
+	}
+
 	err := globalConfig.createChild()
 	if err != nil {
 		globalConfig.LogHandler(ErrorLevel, "restart.createChild", err)

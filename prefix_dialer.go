@@ -26,13 +26,14 @@ func (pd PrefixDialer) Dial(name string) (net.Conn, error) {
 	builder.WriteString(pd.Prefix)
 	builder.WriteString(name)
 
-	c, err := dial(path.Join(pd.WorkingDirectory, builder.String()))
+	socks := path.Join(pd.WorkingDirectory, builder.String())
+	c, err := dial(socks)
 
 	// attempt to remove the file if nobody is listening
 	if err != nil && errorIsNobodyListening(err) {
-		_ = os.Remove(builder.String())
+		_ = os.Remove(socks)
 		// re-dial to have a nice fs.ErrNotExist error
-		c, err = dial(builder.String())
+		c, err = dial(socks)
 	}
 
 	return c, err

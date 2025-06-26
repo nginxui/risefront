@@ -233,6 +233,23 @@ func (cfg Config) runParent(ctx context.Context, socket string) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+
+			// Check if the error is due to listener being closed (normal shutdown)
+			var opErr *net.OpError
+			if errors.As(err, &opErr) {
+				if opErr.Op == "accept" && strings.Contains(opErr.Err.Error(), "use of closed network connection") {
+					// This is expected when shutting down, don't log as error
+					cfg.LogHandler(DebugLevel, "parent.sock.Accept", "child listener closed during shutdown")
+					return nil
+				}
+			}
+
+			// Check for other network closed errors
+			if errors.Is(err, net.ErrClosed) {
+				cfg.LogHandler(DebugLevel, "parent.sock.Accept", "child listener closed")
+				return nil
+			}
+
 			cfg.LogHandler(ErrorLevel, "parent.sock.Accept", err)
 			var ne net.Error
 			if errors.As(err, &ne) && ne.Timeout() {
@@ -260,6 +277,20 @@ func (cfg Config) runExternalListener(ln net.Listener, ch chan net.Conn) {
 		rw, err := ln.Accept()
 
 		if err != nil {
+			// Check if the error is due to listener being closed (normal shutdown)
+			var opErr *net.OpError
+			if errors.As(err, &opErr) {
+				if opErr.Op == "accept" && strings.Contains(opErr.Err.Error(), "use of closed network connection") {
+					return
+				}
+			}
+
+			// Check for other network closed errors
+			if errors.Is(err, net.ErrClosed) {
+				cfg.LogHandler(DebugLevel, "parent."+ln.Addr().String()+".Accept", "listener closed")
+				return
+			}
+
 			cfg.LogHandler(WarnLevel, "parent."+ln.Addr().String()+".Accept", err)
 			var ne net.Error
 			if errors.As(err, &ne) && ne.Timeout() {

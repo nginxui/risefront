@@ -20,6 +20,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/pires/go-proxyproto"
 )
 
 // Storing global configurations for use in Restart functions
@@ -140,6 +142,21 @@ func (wc wgCloser) Close() error {
 		wc.done()
 	}
 	return err
+}
+
+// proxyProtocolListener wraps a net.Listener to automatically parse PROXY protocol headers
+type proxyProtocolListener struct {
+	net.Listener
+}
+
+func (l *proxyProtocolListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	// Wrap connection with PROXY protocol support
+	return proxyproto.NewConn(conn), nil
 }
 
 func (cfg Config) runParent(ctx context.Context, socket string) error {
@@ -370,6 +387,52 @@ func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarder, error
 						cfg.LogHandler(ErrorLevel, "child."+addr+".Dial", err)
 						return
 					}
+
+					// Determine address type and create appropriate PROXY protocol header
+					sourceAddr := cliConn.RemoteAddr()
+					destAddr := cliConn.LocalAddr()
+
+					var transportProtocol proxyproto.AddressFamilyAndProtocol
+					var useProxyProtocol bool = true
+
+					// Type switch to determine the connection type
+					switch addr := sourceAddr.(type) {
+					case *net.TCPAddr:
+						if addr.IP.To4() != nil {
+							transportProtocol = proxyproto.TCPv4
+						} else {
+							transportProtocol = proxyproto.TCPv6
+						}
+					case *net.UnixAddr:
+						// PROXY protocol v2 supports Unix Sockets
+						transportProtocol = proxyproto.UNSPEC
+						// For Unix sockets, we might not want to use PROXY protocol
+						// as they don't have meaningful remote addresses
+						useProxyProtocol = false
+					default:
+						// For unsupported address types, log error and fallback to simple proxy
+						cfg.LogHandler(WarnLevel, "proxy.header", fmt.Errorf("unsupported address type for PROXY protocol: %T, falling back to simple proxy", sourceAddr))
+						useProxyProtocol = false
+					}
+
+					if useProxyProtocol {
+						// Create PROXY protocol v2 header for better compatibility
+						header := &proxyproto.Header{
+							Version:           2,
+							Command:           proxyproto.PROXY,
+							TransportProtocol: transportProtocol,
+							SourceAddr:        sourceAddr,
+							DestinationAddr:   destAddr,
+						}
+
+						// Write PROXY protocol header to server connection
+						_, err = header.WriteTo(srvConn)
+						if err != nil {
+							// Log the error but continue with proxy anyway
+							cfg.LogHandler(WarnLevel, "child."+addr+".ProxyHeader", fmt.Errorf("failed to write PROXY header: %v, continuing without it", err))
+						}
+					}
+
 					proxy(srvConn, cliConn)
 				}()
 			},
@@ -467,7 +530,13 @@ func (cfg Config) runChild(rw io.ReadWriteCloser) error {
 		closeListeners()
 	}()
 
-	if err := cfg.Run(listeners); !errors.Is(err, net.ErrClosed) {
+	// Wrap listeners with PROXY protocol support
+	proxyListeners := make([]net.Listener, len(listeners))
+	for i, ln := range listeners {
+		proxyListeners[i] = &proxyProtocolListener{Listener: ln}
+	}
+
+	if err := cfg.Run(proxyListeners); !errors.Is(err, net.ErrClosed) {
 		return err
 	}
 	return nil

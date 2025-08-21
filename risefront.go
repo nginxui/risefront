@@ -38,6 +38,7 @@ type Dialer interface {
 type Config struct {
 	Addresses []string                   // Addresses to listen to.
 	Run       func([]net.Listener) error // Handle the connections. All open connections should be properly closed before returning (srv.Shutdown for http.Server for instance).
+	Shutdown  func()                     // A callback to trigger graceful shutdown of the Run function.
 
 	Name          string                                                    // Name of the socket file
 	Dialer        Dialer                                                    // Dialer for child-parent communication. Let empty for default dialer (PrefixDialer{}).
@@ -220,8 +221,9 @@ func (cfg Config) runParent(ctx context.Context, socket string) error {
 
 		// first child listener
 		sl := firstChildListener{
-			addr: ln.Addr(),
-			ch:   make(chan net.Conn),
+			addr:   ln.Addr(),
+			ch:     make(chan net.Conn),
+			closed: make(chan struct{}),
 		}
 		firstChildListeners = append(firstChildListeners, &sl)
 
@@ -564,6 +566,11 @@ func Restart() {
 	err := globalConfig.createChild()
 	if err != nil {
 		globalConfig.LogHandler(ErrorLevel, "restart.createChild", err)
+		return
+	}
+
+	if globalConfig.Shutdown != nil {
+		globalConfig.Shutdown()
 	}
 }
 

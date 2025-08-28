@@ -386,6 +386,10 @@ func (cfg Config) handleChildRequest(rw io.ReadWriteCloser) ([]*forwarder, error
 					wgClose.Done()
 					if err != nil {
 						_ = cliConn.Close()
+						if errors.Is(err, os.ErrNotExist) {
+							cfg.LogHandler(DebugLevel, "child."+addr+".Dial", "socket not ready")
+							return
+						}
 						cfg.LogHandler(ErrorLevel, "child."+addr+".Dial", err)
 						return
 					}

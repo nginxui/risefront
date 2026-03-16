@@ -265,6 +265,11 @@ func TestExistingSocket(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Error("parent took too long to be ready")
 	}
+
+	conn, err := dial("risefront.sock")
+	assert.NilError(t, err)
+	assert.NilError(t, conn.Close())
+
 	cancel()
 	select {
 	case <-parentDone:

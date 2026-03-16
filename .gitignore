@@ -24,3 +24,5 @@ go.work
 *.sock
 
 dist
+
+.DS_Store

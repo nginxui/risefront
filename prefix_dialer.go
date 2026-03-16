@@ -42,7 +42,7 @@ func (pd PrefixDialer) Dial(name string) (net.Conn, error) {
 func errorIsNobodyListening(err error) bool {
 	sysErr := &os.SyscallError{}
 	if errors.As(err, &sysErr) {
-		return sysErr.Syscall == "connect" && errors.Is(sysErr.Err, syscall.Errno(111))
+		return sysErr.Syscall == "connect" && errors.Is(sysErr.Err, syscall.ECONNREFUSED)
 	}
 	return false
 }
